@@ -1,14 +1,14 @@
 import yt_dlp
 import sys
 
-browsers = ['safari', 'firefox']
+browsers = ['brave']
 success = None
 
 for browser in browsers:
     opts = {'cookiesfrombrowser': (browser,), 'quiet': True, 'skip_download': True}
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.extract_info("https://www.tiktok.com/@sarsarpan0/video/7616995509441465620", download=False)
+            ydl.extract_info("https://www.tiktok.com/@laurarodsanta/video/7619073626989497622", download=False)
         print(f"SUCCESS: {browser}")
         success = browser
         break
