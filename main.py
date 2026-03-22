@@ -239,6 +239,10 @@ async def proxy_download(request: DownloadRequest):
             actual_file = actual_files[0] if actual_files else None
 
             if actual_file and os.path.getsize(actual_file) > 0:
+                ext = os.path.splitext(actual_file)[1].lstrip('.')
+                mime_map = {'mp4': 'video/mp4', 'webm': 'video/webm', 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png', 'webp': 'image/webp'}
+                media_type = mime_map.get(ext, 'application/octet-stream')
+
                 async def file_streamer():
                     try:
                         with open(actual_file, "rb") as f:
@@ -253,8 +257,8 @@ async def proxy_download(request: DownloadRequest):
 
                 return StreamingResponse(
                     file_streamer(),
-                    media_type="video/mp4",
-                    headers={"Content-Disposition": "attachment; filename=video.mp4"},
+                    media_type=media_type,
+                    headers={"Content-Disposition": f"attachment; filename=media.{ext}"},
                 )
         except Exception as e:
             print(f"yt-dlp download failed: {e}")
@@ -269,6 +273,10 @@ async def proxy_download(request: DownloadRequest):
                     detail=f"Media server returned {head_resp.status_code}. Download unavailable.",
                 )
 
+        is_image = any(ext in request.url.lower() for ext in ('.jpg', '.jpeg', '.png', '.webp'))
+        media_type = "image/jpeg" if is_image else "video/mp4"
+        file_ext = "jpg" if is_image else "mp4"
+
         async def stream_generator():
             async with AsyncSession(impersonate="chrome") as session:
                 async with session.stream("GET", request.url, headers=request.headers) as response:
@@ -277,8 +285,8 @@ async def proxy_download(request: DownloadRequest):
 
         return StreamingResponse(
             stream_generator(),
-            media_type="video/mp4",
-            headers={"Content-Disposition": "attachment; filename=video.mp4"},
+            media_type=media_type,
+            headers={"Content-Disposition": f"attachment; filename=media.{file_ext}"},
         )
     except HTTPException:
         raise
@@ -317,7 +325,11 @@ async def extract_social_media(request: URLRequest):
     if platform == "unknown":
         raise HTTPException(status_code=400, detail="Unsupported platform or invalid URL")
     if platform == "instagram":
-        return extract_instagram(request.url)
+        try:
+            return extract_with_ytdlp(request.url, platform)
+        except Exception as e:
+            print(f"yt-dlp Instagram extraction failed, trying instaloader fallback: {e}")
+            return extract_instagram(request.url)
     else:
         return extract_with_ytdlp(request.url, platform)
 

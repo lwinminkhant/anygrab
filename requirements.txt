@@ -3,3 +3,4 @@ uvicorn==0.24.0.post1
 yt-dlp
 instaloader==4.10.1
 pydantic==2.5.2
+curl_cffi
