@@ -16,6 +16,7 @@
         <header>
             <h1 class="gradient-text">AnyGrab</h1>
             <p>Download videos from TikTok, Instagram, YouTube & X instantly.</p>
+            <div class="save-folder">Saves to: <span id="saveFolder">~/Downloads/AnyGrab</span></div>
         </header>
 
         <main>
@@ -27,6 +28,7 @@
                 </button>
             </div>
             
+            <div id="queueIndicator" class="queue-indicator hide"></div>
             <div id="errorBox" class="error-box hide"></div>
 
             <div id="resultCard" class="result-card hide">
@@ -39,6 +41,13 @@
                     <div class="stats">
                         <span id="mediaViews">👁 0</span>
                         <span id="mediaLikes">❤️ 0</span>
+                    </div>
+                    <div class="audio-toggle-wrapper hide" id="audioToggleWrapper">
+                        <label class="audio-toggle" for="audioOnlyToggle">
+                            <input type="checkbox" id="audioOnlyToggle">
+                            <span class="toggle-slider"></span>
+                        </label>
+                        <span class="audio-toggle-label">Audio Only (MP3)</span>
                     </div>
                     <button class="download-btn" id="downloadBtn">
                         <span class="btn-text">Download High Quality</span>

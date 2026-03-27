@@ -2,24 +2,139 @@ import os
 import re
 import traceback
 import http.cookiejar
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import StreamingResponse, FileResponse
-from curl_cffi.requests import AsyncSession, Session
-from pydantic import BaseModel
-import yt_dlp
-from yt_dlp.networking.impersonate import ImpersonateTarget
-import instaloader
+import time
 import tempfile
 import uuid
 import asyncio
 import glob as glob_module
+import hashlib
+import logging
+from collections import OrderedDict
+from contextlib import asynccontextmanager
 from typing import List, Optional, Dict, Any
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
+from curl_cffi.requests import AsyncSession, Session
+from pydantic import BaseModel
+import yt_dlp
+from yt_dlp.networking.impersonate import ImpersonateTarget
+from yt_dlp.cookies import extract_cookies_from_browser
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("anygrab")
+
+DOWNLOAD_DIR = Path.home() / "Downloads" / "AnyGrab"
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# ---------------------------------------------------------------------------
+# Tunables
+# ---------------------------------------------------------------------------
+MAX_CONCURRENT_EXTRACTIONS = int(os.getenv("MAX_EXTRACTIONS", "6"))
+MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_DOWNLOADS", "4"))
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL", "300"))
+CACHE_MAX_SIZE = int(os.getenv("CACHE_MAX", "256"))
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQ", "30"))
+RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WIN", "60"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "120"))
+
+# ---------------------------------------------------------------------------
+# Concurrency gates
+# ---------------------------------------------------------------------------
+_extract_semaphore: asyncio.Semaphore = None  # type: ignore[assignment]
+_download_semaphore: asyncio.Semaphore = None  # type: ignore[assignment]
+_active_extractions = 0
+_active_downloads = 0
+_total_requests = 0
+
+# ---------------------------------------------------------------------------
+# LRU + TTL cache for extraction results
+# ---------------------------------------------------------------------------
+class TTLCache:
+    __slots__ = ("_max", "_ttl", "_store")
+
+    def __init__(self, maxsize: int, ttl: int):
+        self._max = maxsize
+        self._ttl = ttl
+        self._store: OrderedDict[str, tuple[float, Any]] = OrderedDict()
+
+    def get(self, key: str):
+        entry = self._store.get(key)
+        if entry is None:
+            return None
+        ts, val = entry
+        if time.monotonic() - ts > self._ttl:
+            self._store.pop(key, None)
+            return None
+        self._store.move_to_end(key)
+        return val
+
+    def set(self, key: str, val: Any):
+        self._store[key] = (time.monotonic(), val)
+        self._store.move_to_end(key)
+        while len(self._store) > self._max:
+            self._store.popitem(last=False)
+
+    @property
+    def size(self):
+        return len(self._store)
+
+_extract_cache = TTLCache(CACHE_MAX_SIZE, CACHE_TTL_SECONDS)
+
+# ---------------------------------------------------------------------------
+# Rate limiter (sliding window per IP)
+# ---------------------------------------------------------------------------
+class RateLimiter:
+    __slots__ = ("_limit", "_window", "_clients")
+
+    def __init__(self, limit: int, window: int):
+        self._limit = limit
+        self._window = window
+        self._clients: Dict[str, list[float]] = {}
+
+    def is_allowed(self, key: str) -> bool:
+        now = time.monotonic()
+        hits = self._clients.get(key, [])
+        hits = [t for t in hits if now - t < self._window]
+        if len(hits) >= self._limit:
+            self._clients[key] = hits
+            return False
+        hits.append(now)
+        self._clients[key] = hits
+        return True
+
+    def cleanup(self):
+        now = time.monotonic()
+        stale = [k for k, v in self._clients.items() if all(now - t > self._window for t in v)]
+        for k in stale:
+            del self._clients[k]
+
+_rate_limiter = RateLimiter(RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW)
+
+# ---------------------------------------------------------------------------
+# App lifecycle
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _extract_semaphore, _download_semaphore
+    _extract_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EXTRACTIONS)
+    _download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+    log.info(
+        "AnyGrab ready  |  extractions=%d  downloads=%d  cache=%ds/%d  rate=%d/%ds",
+        MAX_CONCURRENT_EXTRACTIONS, MAX_CONCURRENT_DOWNLOADS,
+        CACHE_TTL_SECONDS, CACHE_MAX_SIZE,
+        RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW,
+    )
+    yield
+    log.info("AnyGrab shutting down")
 
 app = FastAPI(
     title="Universal Social Media Downloader API",
-    description="API to extract metadata, captions, and media URLs from various social platforms."
+    description="API to extract metadata, captions, and media URLs from various social platforms.",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -30,8 +145,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-ig_loader = instaloader.Instaloader(quiet=True)
+# ---------------------------------------------------------------------------
+# Middleware: rate limiting + request timeout + metrics
+# ---------------------------------------------------------------------------
+@app.middleware("http")
+async def rate_limit_and_timeout(request: Request, call_next):
+    global _total_requests
+    _total_requests += 1
 
+    if request.url.path.startswith("/api/"):
+        client_ip = request.client.host if request.client else "unknown"
+        if not _rate_limiter.is_allowed(client_ip):
+            return JSONResponse(
+                {"detail": "Rate limit exceeded. Please slow down."},
+                status_code=429,
+                headers={"Retry-After": str(RATE_LIMIT_WINDOW)},
+            )
+        try:
+            return await asyncio.wait_for(call_next(request), timeout=REQUEST_TIMEOUT)
+        except asyncio.TimeoutError:
+            return JSONResponse({"detail": "Request timed out."}, status_code=504)
+
+    return await call_next(request)
+
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
 class URLRequest(BaseModel):
     url: str
 
@@ -39,6 +178,7 @@ class DownloadRequest(BaseModel):
     url: str
     headers: Dict[str, str] = {}
     original_url: Optional[str] = None
+    audio_only: bool = False
 
 class MediaResponse(BaseModel):
     platform: str
@@ -47,68 +187,107 @@ class MediaResponse(BaseModel):
     metadata: Dict[str, Any]
     http_headers: Dict[str, str] = {}
 
+class SaveRequest(BaseModel):
+    url: str
+    headers: Dict[str, str] = {}
+    original_url: Optional[str] = None
+    filename: Optional[str] = None
+    audio_only: bool = False
+
+class SaveResponse(BaseModel):
+    success: bool
+    filename: str
+    path: str
+    size: int
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _cache_key(url: str) -> str:
+    return hashlib.sha256(url.encode()).hexdigest()
+
 def get_platform(url: str) -> str:
-    if "youtube.com" in url or "youtu.be" in url: return "youtube"
-    if "tiktok.com" in url: return "tiktok"
-    if "twitter.com" in url or "x.com" in url: return "x"
-    if "facebook.com" in url or "fb.watch" in url: return "facebook"
-    if "instagram.com" in url: return "instagram"
+    if "youtube.com" in url or "youtu.be" in url:
+        return "youtube"
+    if "tiktok.com" in url:
+        return "tiktok"
+    if "twitter.com" in url or "x.com" in url:
+        return "x"
+    if "facebook.com" in url or "fb.watch" in url:
+        return "facebook"
+    if "instagram.com" in url:
+        return "instagram"
     return "unknown"
+
+def _run_ytdlp_extract(url: str, ydl_opts: dict) -> dict:
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+def _build_media_response(info: dict, platform: str) -> MediaResponse:
+    caption = info.get("description") or info.get("title")
+    media_urls = []
+    if "url" in info:
+        media_urls.append(info["url"])
+    elif "entries" in info:
+        for entry in info["entries"]:
+            if "url" in entry:
+                media_urls.append(entry["url"])
+
+    clean_metadata = {
+        "id": info.get("id"),
+        "uploader": info.get("uploader"),
+        "upload_date": info.get("upload_date"),
+        "view_count": info.get("view_count"),
+        "like_count": info.get("like_count"),
+        "duration": info.get("duration"),
+        "thumbnail": info.get("thumbnail"),
+        "title": info.get("title"),
+    }
+    return MediaResponse(
+        platform=platform,
+        caption=caption,
+        media_urls=media_urls,
+        metadata=clean_metadata,
+        http_headers=info.get("http_headers", {}),
+    )
 
 def extract_with_ytdlp(url: str, platform: str) -> MediaResponse:
     ydl_opts = {
-        'skip_download': True,
-        'format': 'best[vcodec^=h264]/best[vcodec^=avc]/best',
-        'impersonate': ImpersonateTarget(client='chrome'),
+        "skip_download": True,
+        "format": "best[vcodec^=h264]/best[vcodec^=avc]/best",
+        "impersonate": ImpersonateTarget(client="chrome"),
     }
-    
-    # Try to use cookies.txt if it exists for authentication
-    if os.path.exists('cookies.txt'):
-        ydl_opts['cookiefile'] = 'cookies.txt'
-    else:
-        # Automagically use cookies from the user's Brave browser
-        ydl_opts['cookiesfrombrowser'] = ('brave',)
-    
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            caption = info.get('description') or info.get('title')
-            media_urls = []
-            if 'url' in info:
-                media_urls.append(info['url'])
-            elif 'entries' in info:
-                for entry in info['entries']:
-                    if 'url' in entry:
-                        media_urls.append(entry['url'])
-            
-            clean_metadata = {
-                "id": info.get("id"),
-                "uploader": info.get("uploader"),
-                "upload_date": info.get("upload_date"),
-                "view_count": info.get("view_count"),
-                "like_count": info.get("like_count"),
-                "duration": info.get("duration"),
-                "thumbnail": info.get("thumbnail")
-            }
 
-            return MediaResponse(
-                platform=platform,
-                caption=caption,
-                media_urls=media_urls,
-                metadata=clean_metadata,
-                http_headers=info.get('http_headers', {})
-            )
-            
-    except Exception as e:
-        if platform == "tiktok":
-            print(f"yt-dlp TikTok extraction failed, trying fallback: {e}")
+    if os.path.exists("cookies.txt"):
+        ydl_opts["cookiefile"] = "cookies.txt"
+    elif platform != "youtube":
+        ydl_opts["cookiesfrombrowser"] = ("brave",)
+
+    try:
+        info = _run_ytdlp_extract(url, ydl_opts)
+    except Exception as first_err:
+        if platform == "youtube":
+            log.info("YouTube first attempt failed (%s), retrying without cookies…", first_err)
+            retry_opts = {
+                "skip_download": True,
+                "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                "impersonate": ImpersonateTarget(client="chrome"),
+            }
+            try:
+                info = _run_ytdlp_extract(url, retry_opts)
+            except Exception as retry_err:
+                log.error("YouTube retry failed: %s", traceback.format_exc())
+                raise HTTPException(status_code=400, detail=f"Failed to extract youtube data: {retry_err}")
+        elif platform == "tiktok":
+            log.info("yt-dlp TikTok failed, trying fallback: %s", first_err)
             return extract_tiktok_fallback(url)
-        err_msg = traceback.format_exc()
-        print("EXTRACTION ERROR:", err_msg)
-        raise HTTPException(status_code=400, detail=f"Failed to extract {platform} data: {str(e)}\n\n{err_msg}")
+        else:
+            log.error("Extraction error: %s", traceback.format_exc())
+            raise HTTPException(status_code=400, detail=f"Failed to extract {platform} data: {first_err}")
+
+    return _build_media_response(info, platform)
 
 def extract_tiktok_fallback(url: str) -> MediaResponse:
-    """Fallback TikTok extractor using tikwm.com API when yt-dlp gets 403'd."""
     try:
         s = Session(impersonate="chrome")
         resp = s.get(f"https://www.tikwm.com/api/?url={url}&hd=1", timeout=15)
@@ -119,13 +298,20 @@ def extract_tiktok_fallback(url: str) -> MediaResponse:
             raise ValueError(f"tikwm API error: {data.get('msg', 'unknown')}")
 
         d = data["data"]
+        images = d.get("images", [])
+        is_photo = bool(images)
+
         media_urls = []
-        if d.get("hdplay"):
-            media_urls.append(d["hdplay"])
-        if d.get("play"):
-            media_urls.append(d["play"])
+        if is_photo:
+            media_urls = images
+        else:
+            if d.get("hdplay"):
+                media_urls.append(d["hdplay"])
+            elif d.get("play"):
+                media_urls.append(d["play"])
+
         if not media_urls:
-            raise ValueError("No video URLs returned from tikwm API")
+            raise ValueError("No media URLs returned from tikwm API")
 
         return MediaResponse(
             platform="tiktok",
@@ -137,7 +323,8 @@ def extract_tiktok_fallback(url: str) -> MediaResponse:
                 "upload_date": None,
                 "view_count": d.get("play_count"),
                 "like_count": d.get("digg_count"),
-                "duration": d.get("duration"),
+                "duration": d.get("duration") if not is_photo else None,
+                "is_video": not is_photo,
                 "thumbnail": d.get("cover"),
             },
             http_headers={},
@@ -145,135 +332,245 @@ def extract_tiktok_fallback(url: str) -> MediaResponse:
     except HTTPException:
         raise
     except Exception as e:
-        err_msg = traceback.format_exc()
-        print("TIKTOK FALLBACK ERROR:", err_msg)
-        raise HTTPException(status_code=400, detail=f"Failed to extract TikTok data: {str(e)}")
+        log.error("TikTok fallback error: %s", traceback.format_exc())
+        raise HTTPException(status_code=400, detail=f"Failed to extract TikTok data: {e}")
+
+def _shortcode_to_media_id(shortcode: str) -> str:
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    media_id = 0
+    for char in shortcode:
+        media_id = media_id * 64 + alphabet.index(char)
+    return str(media_id)
+
+def _get_instagram_session() -> Session:
+    s = Session(impersonate="chrome")
+    if os.path.exists("cookies.txt"):
+        cookie_jar = http.cookiejar.MozillaCookieJar("cookies.txt")
+        cookie_jar.load(ignore_discard=True, ignore_expires=True)
+        for c in cookie_jar:
+            s.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
+    else:
+        jar = extract_cookies_from_browser("brave")
+        for c in jar:
+            if "instagram" in c.domain:
+                s.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
+    return s
 
 def extract_instagram(url: str) -> MediaResponse:
-    try:
-        if os.path.exists("cookies.txt"):
-            cookie_jar = http.cookiejar.MozillaCookieJar("cookies.txt")
-            cookie_jar.load(ignore_discard=True, ignore_expires=True)
-            ig_loader.context._session.cookies.update(cookie_jar)
+    match = re.search(r"(?:p|reel|tv)/([^/?#&]+)", url)
+    if not match:
+        raise HTTPException(status_code=400, detail="Invalid Instagram URL. Must be a post or reel.")
 
-        match = re.search(r"(?:p|reel|tv)/([^/?#&]+)", url)
-        if not match:
-            raise ValueError("Invalid Instagram URL. Must be a post or reel.")
-        
-        shortcode = match.group(1)
-        post = instaloader.Post.from_shortcode(ig_loader.context, shortcode)
-        
+    shortcode = match.group(1)
+    media_id = _shortcode_to_media_id(shortcode)
+
+    try:
+        s = _get_instagram_session()
+        api_url = f"https://www.instagram.com/api/v1/media/{media_id}/info/"
+        resp = s.get(api_url, headers={
+            "X-IG-App-ID": "936619743392459",
+            "X-Requested-With": "XMLHttpRequest",
+        }, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+
+        item = data["items"][0]
+        caption_data = item.get("caption") or {}
+        caption = caption_data.get("text", "") if isinstance(caption_data, dict) else ""
+        user = item.get("user", {})
+        is_video = item.get("media_type") == 2
+
         media_urls = []
-        if post.is_video:
-            media_urls.append(post.video_url)
-        else:
-            media_urls.append(post.url)
-            
-        if post.typename == 'GraphSidecar':
-            media_urls = []
-            for node in post.get_sidecar_nodes():
-                if node.is_video:
-                    media_urls.append(node.video_url)
+        carousel = item.get("carousel_media", [])
+        if carousel:
+            for cm in carousel:
+                vid_versions = cm.get("video_versions", [])
+                if vid_versions:
+                    media_urls.append(vid_versions[0]["url"])
                 else:
-                    media_urls.append(node.display_url)
+                    candidates = cm.get("image_versions2", {}).get("candidates", [])
+                    if candidates:
+                        best = max(candidates, key=lambda c: c.get("width", 0) * c.get("height", 0))
+                        media_urls.append(best["url"])
+        elif is_video:
+            vid_versions = item.get("video_versions", [])
+            if vid_versions:
+                media_urls.append(vid_versions[0]["url"])
+        else:
+            candidates = item.get("image_versions2", {}).get("candidates", [])
+            if candidates:
+                best = max(candidates, key=lambda c: c.get("width", 0) * c.get("height", 0))
+                media_urls.append(best["url"])
+
+        if not media_urls:
+            raise ValueError("No media URLs found in API response")
 
         metadata = {
-            "id": post.shortcode,
-            "owner_username": post.owner_username,
-            "date_utc": str(post.date_utc),
-            "likes": post.likes,
-            "comments": post.comments,
-            "is_video": post.is_video
+            "id": shortcode,
+            "owner_username": user.get("username"),
+            "upload_date": item.get("taken_at"),
+            "likes": item.get("like_count"),
+            "comments": item.get("comment_count"),
+            "is_video": is_video,
+            "thumbnail": item.get("image_versions2", {}).get("candidates", [{}])[0].get("url") if not carousel else None,
         }
 
-        return MediaResponse(
-            platform="instagram",
-            caption=post.caption,
-            media_urls=media_urls,
-            metadata=metadata
-        )
-
+        return MediaResponse(platform="instagram", caption=caption, media_urls=media_urls, metadata=metadata)
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to extract Instagram data: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Failed to extract Instagram data: {e}")
+
+# ---------------------------------------------------------------------------
+# Temp file cleanup helper
+# ---------------------------------------------------------------------------
+def _cleanup_files(pattern: str):
+    for f in glob_module.glob(pattern):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+@app.post("/api/v1/extract", response_model=MediaResponse)
+async def extract_social_media(request: URLRequest):
+    global _active_extractions
+    platform = get_platform(request.url)
+    if platform == "unknown":
+        raise HTTPException(status_code=400, detail="Unsupported platform or invalid URL")
+
+    cache_key = _cache_key(request.url)
+    cached = _extract_cache.get(cache_key)
+    if cached is not None:
+        log.info("Cache hit for %s", request.url[:80])
+        return cached
+
+    async with _extract_semaphore:
+        _active_extractions += 1
+        try:
+            if platform == "instagram":
+                try:
+                    result = await asyncio.to_thread(extract_with_ytdlp, request.url, platform)
+                except Exception as e:
+                    log.info("yt-dlp Instagram failed, trying API fallback: %s", e)
+                    result = await asyncio.to_thread(extract_instagram, request.url)
+            elif platform == "tiktok" and "/photo/" in request.url:
+                result = await asyncio.to_thread(extract_tiktok_fallback, request.url)
+            else:
+                result = await asyncio.to_thread(extract_with_ytdlp, request.url, platform)
+
+            _extract_cache.set(cache_key, result)
+            return result
+        finally:
+            _active_extractions -= 1
+
 
 @app.post("/api/v1/download")
 async def proxy_download(request: DownloadRequest):
-    """Proxy the video stream to bypass CORS and Varnish Cache 403 blocks."""
+    global _active_downloads
     platform = get_platform(request.original_url) if request.original_url else "unknown"
 
-    # TikTok: use tikwm (fast, reliable) first, yt-dlp as fallback
-    if platform == "tiktok" and request.original_url:
+    async with _download_semaphore:
+        _active_downloads += 1
         try:
-            return await _download_tiktok_fallback(request.original_url)
-        except Exception as e:
-            print(f"TikTok tikwm download failed: {e}, trying yt-dlp...")
+            if platform == "tiktok" and request.original_url:
+                try:
+                    return await _download_tiktok_fallback(request.original_url)
+                except Exception as e:
+                    log.info("TikTok tikwm download failed: %s, trying yt-dlp…", e)
 
-    # yt-dlp file download (works for most platforms, sometimes TikTok)
-    if request.original_url:
-        temp_dir = tempfile.gettempdir()
-        file_id = str(uuid.uuid4())
-        filepath_base = os.path.join(temp_dir, file_id)
+            if request.original_url:
+                result = await _ytdlp_stream_download(request, platform)
+                if result is not None:
+                    return result
 
+            return await _proxy_stream_download(request)
+        finally:
+            _active_downloads -= 1
+
+
+async def _ytdlp_stream_download(request: DownloadRequest, platform: str) -> Optional[StreamingResponse]:
+    temp_dir = tempfile.gettempdir()
+    file_id = str(uuid.uuid4())
+    filepath_base = os.path.join(temp_dir, file_id)
+
+    if request.audio_only and platform == "youtube":
         ydl_opts = {
-            'format': 'best[vcodec^=h264]/best[vcodec^=avc]/best',
-            'merge_output_format': 'mp4',
-            'noplaylist': True,
-            'outtmpl': filepath_base + '.%(ext)s',
-            'quiet': True,
-            'impersonate': ImpersonateTarget(client='chrome'),
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "noplaylist": True,
+            "outtmpl": filepath_base + ".%(ext)s",
+            "quiet": True,
+            "impersonate": ImpersonateTarget(client="chrome"),
+            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
+        }
+    else:
+        ydl_opts = {
+            "format": "best[vcodec^=h264]/best[vcodec^=avc]/best",
+            "merge_output_format": "mp4",
+            "noplaylist": True,
+            "outtmpl": filepath_base + ".%(ext)s",
+            "quiet": True,
+            "impersonate": ImpersonateTarget(client="chrome"),
         }
 
-        if os.path.exists('cookies.txt'):
-            ydl_opts['cookiefile'] = 'cookies.txt'
-        else:
-            ydl_opts['cookiesfrombrowser'] = ('brave',)
+    if os.path.exists("cookies.txt"):
+        ydl_opts["cookiefile"] = "cookies.txt"
+    elif platform != "youtube":
+        ydl_opts["cookiesfrombrowser"] = ("brave",)
 
-        try:
-            def download_video():
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([request.original_url])
+    try:
+        def download_video():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([request.original_url])
 
-            await asyncio.to_thread(download_video)
+        await asyncio.to_thread(download_video)
 
-            actual_files = glob_module.glob(filepath_base + '.*')
-            actual_file = actual_files[0] if actual_files else None
+        actual_files = glob_module.glob(filepath_base + ".*")
+        actual_file = actual_files[0] if actual_files else None
 
-            if actual_file and os.path.getsize(actual_file) > 0:
-                ext = os.path.splitext(actual_file)[1].lstrip('.')
-                mime_map = {'mp4': 'video/mp4', 'webm': 'video/webm', 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png', 'webp': 'image/webp'}
-                media_type = mime_map.get(ext, 'application/octet-stream')
+        if actual_file and os.path.getsize(actual_file) > 0:
+            ext = os.path.splitext(actual_file)[1].lstrip(".")
+            mime_map = {
+                "mp4": "video/mp4", "webm": "video/webm", "mp3": "audio/mpeg",
+                "m4a": "audio/mp4", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                "png": "image/png", "webp": "image/webp",
+            }
+            media_type = mime_map.get(ext, "application/octet-stream")
+            dl_filename = "audio" if request.audio_only else "media"
+            file_size = os.path.getsize(actual_file)
 
-                async def file_streamer():
-                    try:
-                        with open(actual_file, "rb") as f:
-                            while chunk := f.read(1024 * 64):
-                                yield chunk
-                    finally:
-                        for cleanup_f in glob_module.glob(filepath_base + '.*'):
-                            try:
-                                os.remove(cleanup_f)
-                            except:
-                                pass
+            async def file_streamer():
+                try:
+                    with open(actual_file, "rb") as f:
+                        while chunk := f.read(1024 * 256):
+                            yield chunk
+                finally:
+                    _cleanup_files(filepath_base + ".*")
 
-                return StreamingResponse(
-                    file_streamer(),
-                    media_type=media_type,
-                    headers={"Content-Disposition": f"attachment; filename=media.{ext}"},
-                )
-        except Exception as e:
-            print(f"yt-dlp download failed: {e}")
+            return StreamingResponse(
+                file_streamer(),
+                media_type=media_type,
+                headers={
+                    "Content-Disposition": f"attachment; filename={dl_filename}.{ext}",
+                    "Content-Length": str(file_size),
+                },
+            )
+    except Exception as e:
+        _cleanup_files(filepath_base + ".*")
+        log.warning("yt-dlp download failed: %s", e)
+    return None
 
-    # Last resort: proxy the direct media URL (works for non-TikTok CDNs)
+
+async def _proxy_stream_download(request: DownloadRequest) -> StreamingResponse:
     try:
         async with AsyncSession(impersonate="chrome") as session:
-            head_resp = await session.head(request.url, headers=request.headers)
+            head_resp = await session.head(request.url, headers=request.headers, timeout=10)
             if head_resp.status_code not in (200, 206):
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Media server returned {head_resp.status_code}. Download unavailable.",
-                )
+                raise HTTPException(status_code=502, detail=f"Media server returned {head_resp.status_code}. Download unavailable.")
 
-        is_image = any(ext in request.url.lower() for ext in ('.jpg', '.jpeg', '.png', '.webp'))
+        is_image = any(ext in request.url.lower() for ext in (".jpg", ".jpeg", ".png", ".webp"))
         media_type = "image/jpeg" if is_image else "video/mp4"
         file_ext = "jpg" if is_image else "mp4"
 
@@ -291,14 +588,17 @@ async def proxy_download(request: DownloadRequest):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Download failed: {e}")
+
 
 async def _download_tiktok_fallback(tiktok_url: str) -> StreamingResponse:
-    """Download a TikTok video via tikwm.com when yt-dlp is blocked."""
-    s = Session(impersonate="chrome")
-    api_resp = s.get(f"https://www.tikwm.com/api/?url={tiktok_url}&hd=1", timeout=15)
-    api_resp.raise_for_status()
-    data = api_resp.json()
+    def fetch_api():
+        s = Session(impersonate="chrome")
+        api_resp = s.get(f"https://www.tikwm.com/api/?url={tiktok_url}&hd=1", timeout=15)
+        api_resp.raise_for_status()
+        return api_resp.json()
+
+    data = await asyncio.to_thread(fetch_api)
 
     if data.get("code") != 0:
         raise ValueError(f"tikwm API error: {data.get('msg')}")
@@ -319,28 +619,173 @@ async def _download_tiktok_fallback(tiktok_url: str) -> StreamingResponse:
         headers={"Content-Disposition": "attachment; filename=video.mp4"},
     )
 
-@app.post("/api/v1/extract", response_model=MediaResponse)
-async def extract_social_media(request: URLRequest):
-    platform = get_platform(request.url)
-    if platform == "unknown":
-        raise HTTPException(status_code=400, detail="Unsupported platform or invalid URL")
-    if platform == "instagram":
-        try:
-            return extract_with_ytdlp(request.url, platform)
-        except Exception as e:
-            print(f"yt-dlp Instagram extraction failed, trying instaloader fallback: {e}")
-            return extract_instagram(request.url)
-    else:
-        return extract_with_ytdlp(request.url, platform)
 
+@app.get("/api/v1/download")
+async def proxy_download_get(url: str, original_url: Optional[str] = None):
+    req = DownloadRequest(url=url, original_url=original_url)
+    return await proxy_download(req)
+
+
+@app.post("/api/v1/save", response_model=SaveResponse)
+async def save_to_disk(request: SaveRequest):
+    global _active_downloads
+    platform = get_platform(request.original_url) if request.original_url else "unknown"
+    ts = int(time.time() * 1000)
+    is_image = any(ext in request.url.lower() for ext in (".jpg", ".jpeg", ".png", ".webp"))
+    default_ext = "mp3" if request.audio_only else ("jpg" if is_image else "mp4")
+    filename = request.filename or f"AnyGrab_{ts}.{default_ext}"
+    filepath = DOWNLOAD_DIR / filename
+
+    async with _download_semaphore:
+        _active_downloads += 1
+        try:
+            if platform == "tiktok" and request.original_url and not is_image:
+                try:
+                    result = await _save_tiktok_fallback(request, filepath, filename)
+                    if result:
+                        return result
+                except Exception as e:
+                    log.info("TikTok tikwm save failed: %s, trying yt-dlp…", e)
+
+            if request.original_url and not is_image:
+                result = await _save_via_ytdlp(request, filepath, platform)
+                if result:
+                    return result
+
+            return await _save_via_proxy(request, filepath, filename)
+        finally:
+            _active_downloads -= 1
+
+
+async def _save_tiktok_fallback(request: SaveRequest, filepath: Path, filename: str) -> Optional[SaveResponse]:
+    def fetch_api():
+        s = Session(impersonate="chrome")
+        api_resp = s.get(f"https://www.tikwm.com/api/?url={request.original_url}&hd=1", timeout=15)
+        api_resp.raise_for_status()
+        return api_resp.json()
+
+    data = await asyncio.to_thread(fetch_api)
+    if data.get("code") != 0:
+        return None
+
+    video_url = data["data"].get("hdplay") or data["data"].get("play")
+    if not video_url:
+        return None
+
+    async with AsyncSession(impersonate="chrome") as session:
+        resp = await session.get(video_url, timeout=60)
+        filepath.write_bytes(resp.content)
+        return SaveResponse(success=True, filename=filename, path=str(filepath), size=len(resp.content))
+
+
+async def _save_via_ytdlp(request: SaveRequest, filepath: Path, platform: str) -> Optional[SaveResponse]:
+    if request.audio_only and platform == "youtube":
+        ydl_opts = {
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "noplaylist": True,
+            "outtmpl": str(filepath.with_suffix(".%(ext)s")),
+            "quiet": True,
+            "impersonate": ImpersonateTarget(client="chrome"),
+            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
+        }
+    else:
+        ydl_opts = {
+            "format": "best[vcodec^=h264]/best[vcodec^=avc]/best",
+            "merge_output_format": "mp4",
+            "noplaylist": True,
+            "outtmpl": str(filepath.with_suffix(".%(ext)s")),
+            "quiet": True,
+            "impersonate": ImpersonateTarget(client="chrome"),
+        }
+
+    if os.path.exists("cookies.txt"):
+        ydl_opts["cookiefile"] = "cookies.txt"
+    elif platform != "youtube":
+        ydl_opts["cookiesfrombrowser"] = ("brave",)
+
+    try:
+        def dl():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([request.original_url])
+
+        await asyncio.to_thread(dl)
+
+        stem = filepath.with_suffix("").name
+        saved = list(DOWNLOAD_DIR.glob(f"{stem}.*"))
+        if saved and saved[0].stat().st_size > 0:
+            actual = saved[0]
+            return SaveResponse(success=True, filename=actual.name, path=str(actual), size=actual.stat().st_size)
+    except Exception as e:
+        log.warning("yt-dlp save failed: %s", e)
+    return None
+
+
+async def _save_via_proxy(request: SaveRequest, filepath: Path, filename: str) -> SaveResponse:
+    try:
+        async with AsyncSession(impersonate="chrome") as session:
+            resp = await session.get(request.url, headers=request.headers, timeout=60)
+            if resp.status_code not in (200, 206):
+                raise HTTPException(status_code=502, detail=f"Media server returned {resp.status_code}")
+            filepath.write_bytes(resp.content)
+            return SaveResponse(success=True, filename=filename, path=str(filepath), size=len(resp.content))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Save failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Monitoring endpoints
+# ---------------------------------------------------------------------------
+@app.get("/api/v1/settings")
+async def get_settings():
+    return {"download_dir": str(DOWNLOAD_DIR)}
+
+@app.get("/api/v1/health")
+async def health():
+    return {
+        "status": "healthy",
+        "active_extractions": _active_extractions,
+        "active_downloads": _active_downloads,
+        "max_extractions": MAX_CONCURRENT_EXTRACTIONS,
+        "max_downloads": MAX_CONCURRENT_DOWNLOADS,
+        "cache_size": _extract_cache.size,
+        "total_requests": _total_requests,
+    }
+
+@app.get("/api/v1/queue")
+async def queue_status():
+    extract_available = MAX_CONCURRENT_EXTRACTIONS - _active_extractions
+    download_available = MAX_CONCURRENT_DOWNLOADS - _active_downloads
+    return {
+        "extractions": {"active": _active_extractions, "max": MAX_CONCURRENT_EXTRACTIONS, "available": max(extract_available, 0)},
+        "downloads": {"active": _active_downloads, "max": MAX_CONCURRENT_DOWNLOADS, "available": max(download_available, 0)},
+        "cache": {"size": _extract_cache.size, "max": CACHE_MAX_SIZE, "ttl_seconds": CACHE_TTL_SECONDS},
+    }
+
+# ---------------------------------------------------------------------------
+# Frontend
+# ---------------------------------------------------------------------------
 @app.get("/")
 async def serve_frontend():
-    """Serve the frontend index.html on the root URL."""
     return FileResponse(os.path.join("public", "index.html"))
 
-# Mount static files for assets (css, js) directly on the root path
 app.mount("/", StaticFiles(directory="public"), name="public")
 
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+    workers = int(os.getenv("WORKERS", "1"))
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        workers=workers,
+        timeout_keep_alive=30,
+        limit_concurrency=100,
+        limit_max_requests=10000,
+        access_log=False,
+    )
