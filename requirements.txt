@@ -3,6 +3,7 @@ uvicorn>=0.24.0
 yt-dlp
 pydantic>=2.5.2
 curl_cffi
-pyTelegramBotAPI
-requests
 python-dotenv
+aiogram>=3.10
+aiosqlite
+aiohttp

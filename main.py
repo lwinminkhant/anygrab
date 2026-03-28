@@ -498,21 +498,22 @@ async def _ytdlp_stream_download(request: DownloadRequest, platform: str) -> Opt
 
     if request.audio_only and platform == "youtube":
         ydl_opts = {
-            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "format": "140/bestaudio[ext=m4a]/bestaudio",
             "noplaylist": True,
             "outtmpl": filepath_base + ".%(ext)s",
             "quiet": True,
             "impersonate": ImpersonateTarget(client="chrome"),
-            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
+            "concurrent_fragment_downloads": 8,
         }
     else:
         ydl_opts = {
-            "format": "best[vcodec^=h264]/best[vcodec^=avc]/best",
+            "format": "bestvideo[ext=mp4][vcodec^=avc1]+140/best[vcodec^=h264]/best[vcodec^=avc]/best",
             "merge_output_format": "mp4",
             "noplaylist": True,
             "outtmpl": filepath_base + ".%(ext)s",
             "quiet": True,
             "impersonate": ImpersonateTarget(client="chrome"),
+            "concurrent_fragment_downloads": 8,
         }
 
     if os.path.exists("cookies.txt"):
@@ -681,21 +682,22 @@ async def _save_tiktok_fallback(request: SaveRequest, filepath: Path, filename: 
 async def _save_via_ytdlp(request: SaveRequest, filepath: Path, platform: str) -> Optional[SaveResponse]:
     if request.audio_only and platform == "youtube":
         ydl_opts = {
-            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "format": "140/bestaudio[ext=m4a]/bestaudio",
             "noplaylist": True,
             "outtmpl": str(filepath.with_suffix(".%(ext)s")),
             "quiet": True,
             "impersonate": ImpersonateTarget(client="chrome"),
-            "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
+            "concurrent_fragment_downloads": 8,
         }
     else:
         ydl_opts = {
-            "format": "best[vcodec^=h264]/best[vcodec^=avc]/best",
+            "format": "bestvideo[ext=mp4][vcodec^=avc1]+140/best[vcodec^=h264]/best[vcodec^=avc]/best",
             "merge_output_format": "mp4",
             "noplaylist": True,
             "outtmpl": str(filepath.with_suffix(".%(ext)s")),
             "quiet": True,
             "impersonate": ImpersonateTarget(client="chrome"),
+            "concurrent_fragment_downloads": 8,
         }
 
     if os.path.exists("cookies.txt"):
