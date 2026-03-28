@@ -1,0 +1,26 @@
+[Unit]
+Description=AnyGrab API Server
+After=network.target
+
+[Service]
+Type=simple
+User=anygrab
+Group=anygrab
+WorkingDirectory=/opt/anygrab
+EnvironmentFile=/opt/anygrab/.env
+ExecStart=/opt/anygrab/.venv/bin/python main.py
+Restart=always
+RestartSec=5
+
+Environment=WORKERS=2
+Environment=MAX_EXTRACTIONS=8
+Environment=MAX_DOWNLOADS=6
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/anygrab /tmp
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

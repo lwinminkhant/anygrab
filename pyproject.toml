@@ -1,7 +1,19 @@
 [project]
-name = "sdl"
-version = "0.1.0"
-description = "Add your description here"
+name = "anygrab"
+version = "1.0.0"
+description = "Universal social media downloader — web UI + Telegram bot"
 readme = "README.md"
-requires-python = ">=3.12.6"
-dependencies = []
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.104.1",
+    "uvicorn>=0.24.0",
+    "yt-dlp",
+    "pydantic>=2.5.2",
+    "curl_cffi",
+    "python-dotenv",
+    "aiogram>=3.10",
+    "aiosqlite",
+    "aiohttp",
+    "pyrogram",
+    "tgcrypto",
+]

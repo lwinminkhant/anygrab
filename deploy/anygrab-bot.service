@@ -1,0 +1,27 @@
+[Unit]
+Description=AnyGrab Telegram Bot
+After=network.target anygrab-api.service
+Requires=anygrab-api.service
+
+[Service]
+Type=simple
+User=anygrab
+Group=anygrab
+WorkingDirectory=/opt/anygrab
+EnvironmentFile=/opt/anygrab/.env
+ExecStart=/opt/anygrab/.venv/bin/python telegram_bot.py
+Restart=always
+RestartSec=5
+
+Environment=API_BASE_URL=http://127.0.0.1:8000/api/v1
+Environment=BOT_WORKERS=4
+Environment=FRAGMENT_THREADS=8
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/anygrab /tmp
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

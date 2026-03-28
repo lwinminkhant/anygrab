@@ -7,3 +7,5 @@ python-dotenv
 aiogram>=3.10
 aiosqlite
 aiohttp
+pyrogram
+tgcrypto

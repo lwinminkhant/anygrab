@@ -1,0 +1,39 @@
+services:
+  api:
+    build: .
+    container_name: anygrab-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      - WORKERS=2
+      - MAX_EXTRACTIONS=8
+      - MAX_DOWNLOADS=6
+    volumes:
+      - ./cookies.txt:/app/cookies.txt:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  bot:
+    build: .
+    container_name: anygrab-bot
+    restart: unless-stopped
+    command: python telegram_bot.py
+    env_file: .env
+    environment:
+      - API_BASE_URL=http://api:8000/api/v1
+      - BOT_WORKERS=4
+      - FRAGMENT_THREADS=8
+    volumes:
+      - ./cookies.txt:/app/cookies.txt:ro
+      - bot-data:/app/data
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  bot-data:
