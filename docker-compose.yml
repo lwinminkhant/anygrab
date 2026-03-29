@@ -10,13 +10,14 @@ services:
       - WORKERS=2
       - MAX_EXTRACTIONS=8
       - MAX_DOWNLOADS=6
-    volumes:
-      - ./cookies.txt:/app/cookies.txt:ro
+    # Use localhost, not 127.0.0.1: Starlette TrustedHostMiddleware parses Host by splitting on
+    # the first ":" only, so 127.0.0.1:8000 becomes host "127" and would never match.
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
-      interval: 30s
+      interval: 15s
       timeout: 5s
-      retries: 3
+      retries: 5
+      start_period: 60s
 
   bot:
     build: .
@@ -25,15 +26,33 @@ services:
     command: python telegram_bot.py
     env_file: .env
     environment:
-      - API_BASE_URL=http://api:8000/api/v1
+      # Default: same Docker network. Override in .env if the bot must call a public API URL.
+      - API_BASE_URL=${API_BASE_URL:-http://api:8000/api/v1}
       - BOT_WORKERS=4
       - FRAGMENT_THREADS=8
     volumes:
-      - ./cookies.txt:/app/cookies.txt:ro
       - bot-data:/app/data
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # HTTPS on anygrab.lwinminkhant.pro — requires DNS pointing here and ports 80/443 open.
+  caddy:
+    image: caddy:2-alpine
+    container_name: anygrab-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
     depends_on:
       api:
         condition: service_healthy
 
 volumes:
   bot-data:
+  caddy-data:
+  caddy-config:

@@ -275,14 +275,22 @@ def _file_size_label(nbytes: int) -> str:
 
 # ── yt-dlp Direct Integration ────────────────────────────────────────────────
 
+def _netscape_cookie_file() -> Optional[str]:
+    p = "cookies.txt"
+    if not os.path.isfile(p) or os.path.getsize(p) == 0:
+        return None
+    return p
+
+
 def _base_opts() -> dict:
     opts: dict = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
     }
-    if os.path.exists("cookies.txt"):
-        opts["cookiefile"] = "cookies.txt"
+    cf = _netscape_cookie_file()
+    if cf:
+        opts["cookiefile"] = cf
     try:
         from yt_dlp.networking.impersonate import ImpersonateTarget
         opts["impersonate"] = ImpersonateTarget(client="chrome")
