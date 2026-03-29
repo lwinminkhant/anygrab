@@ -16,6 +16,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from curl_cffi.requests import AsyncSession, Session
@@ -26,6 +27,18 @@ from yt_dlp.cookies import extract_cookies_from_browser
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("anygrab")
+
+COOKIE_FILE = "cookies.txt"
+
+
+def _netscape_cookie_file() -> Optional[str]:
+    """Return cookies.txt path only if it is a non-empty regular file.
+
+    Docker bind-mounts a missing source as a *directory* named cookies.txt, which must not be used.
+    """
+    if not os.path.isfile(COOKIE_FILE) or os.path.getsize(COOKIE_FILE) == 0:
+        return None
+    return COOKIE_FILE
 
 DOWNLOAD_DIR = Path.home() / "Downloads" / "AnyGrab"
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -131,19 +144,40 @@ async def lifespan(app: FastAPI):
     yield
     log.info("AnyGrab shutting down")
 
-app = FastAPI(
-    title="Universal Social Media Downloader API",
-    description="API to extract metadata, captions, and media URLs from various social platforms.",
-    lifespan=lifespan,
-)
+_PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
+_fastapi_kw: Dict[str, Any] = {
+    "title": "Universal Social Media Downloader API",
+    "description": "API to extract metadata, captions, and media URLs from various social platforms.",
+    "lifespan": lifespan,
+}
+if _PUBLIC_URL:
+    _fastapi_kw["servers"] = [{"url": _PUBLIC_URL, "description": "Public"}]
 
+app = FastAPI(**_fastapi_kw)
+
+_cors_origins = os.getenv("CORS_ORIGINS", "*").strip()
+if _cors_origins == "*":
+    _allow_origins = ["*"]
+else:
+    _allow_origins = [o.strip() for o in _cors_origins.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+_trusted_hosts = os.getenv("TRUSTED_HOSTS", "").strip()
+if _trusted_hosts and _trusted_hosts != "*":
+    _th_list = [h.strip() for h in _trusted_hosts.split(",") if h.strip()]
+    # Docker healthchecks use Host: localhost; the bot uses http://api:8000 (Host: api).
+    # Starlette TrustedHostMiddleware splits Host on the first ":" only, so 127.0.0.1:8000 is read as
+    # "127", not "127.0.0.1" — include "127" so loopback IPv4 works.
+    for _h in ("localhost", "127.0.0.1", "127", "[::1]", "api"):
+        if _h not in _th_list:
+            _th_list.append(_h)
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=_th_list)
 
 # ---------------------------------------------------------------------------
 # Middleware: rate limiting + request timeout + metrics
@@ -153,7 +187,7 @@ async def rate_limit_and_timeout(request: Request, call_next):
     global _total_requests
     _total_requests += 1
 
-    if request.url.path.startswith("/api/"):
+    if request.url.path.startswith("/api/") and request.url.path != "/api/v1/health":
         client_ip = request.client.host if request.client else "unknown"
         if not _rate_limiter.is_allowed(client_ip):
             return JSONResponse(
@@ -258,8 +292,9 @@ def extract_with_ytdlp(url: str, platform: str) -> MediaResponse:
         "impersonate": ImpersonateTarget(client="chrome"),
     }
 
-    if os.path.exists("cookies.txt"):
-        ydl_opts["cookiefile"] = "cookies.txt"
+    cf = _netscape_cookie_file()
+    if cf:
+        ydl_opts["cookiefile"] = cf
     elif platform != "youtube":
         ydl_opts["cookiesfrombrowser"] = ("brave",)
 
@@ -344,16 +379,20 @@ def _shortcode_to_media_id(shortcode: str) -> str:
 
 def _get_instagram_session() -> Session:
     s = Session(impersonate="chrome")
-    if os.path.exists("cookies.txt"):
-        cookie_jar = http.cookiejar.MozillaCookieJar("cookies.txt")
-        cookie_jar.load(ignore_discard=True, ignore_expires=True)
-        for c in cookie_jar:
-            s.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
-    else:
-        jar = extract_cookies_from_browser("brave")
-        for c in jar:
-            if "instagram" in c.domain:
+    p = _netscape_cookie_file()
+    if p:
+        try:
+            cookie_jar = http.cookiejar.MozillaCookieJar(p)
+            cookie_jar.load(ignore_discard=True, ignore_expires=True)
+            for c in cookie_jar:
                 s.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
+            return s
+        except Exception as e:
+            log.warning("cookies.txt could not be read (%s), trying browser cookies", e)
+    jar = extract_cookies_from_browser("brave")
+    for c in jar:
+        if "instagram" in c.domain:
+            s.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
     return s
 
 def extract_instagram(url: str) -> MediaResponse:
@@ -516,8 +555,9 @@ async def _ytdlp_stream_download(request: DownloadRequest, platform: str) -> Opt
             "concurrent_fragment_downloads": 8,
         }
 
-    if os.path.exists("cookies.txt"):
-        ydl_opts["cookiefile"] = "cookies.txt"
+    cf = _netscape_cookie_file()
+    if cf:
+        ydl_opts["cookiefile"] = cf
     elif platform != "youtube":
         ydl_opts["cookiesfrombrowser"] = ("brave",)
 
@@ -700,8 +740,9 @@ async def _save_via_ytdlp(request: SaveRequest, filepath: Path, platform: str) -
             "concurrent_fragment_downloads": 8,
         }
 
-    if os.path.exists("cookies.txt"):
-        ydl_opts["cookiefile"] = "cookies.txt"
+    cf = _netscape_cookie_file()
+    if cf:
+        ydl_opts["cookiefile"] = cf
     elif platform != "youtube":
         ydl_opts["cookiesfrombrowser"] = ("brave",)
 

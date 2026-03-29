@@ -11,3 +11,6 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+
+# Do not bake secrets into the image; empty cookies.txt is created in Dockerfile.
+cookies.txt
