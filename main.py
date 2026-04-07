@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from typing import List, Optional, Dict, Any
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -28,7 +28,10 @@ from yt_dlp.cookies import extract_cookies_from_browser
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("anygrab")
 
-COOKIE_FILE = "cookies.txt"
+# Accept either an absolute COOKIE_FILE path or a path relative to this repo.
+_COOKIE_FILE_ENV = os.getenv("COOKIE_FILE", "cookies.txt")
+_BASE_DIR = Path(__file__).resolve().parent
+COOKIE_FILE_PATH = (Path(_COOKIE_FILE_ENV) if os.path.isabs(_COOKIE_FILE_ENV) else (_BASE_DIR / _COOKIE_FILE_ENV)).resolve()
 
 
 def _netscape_cookie_file() -> Optional[str]:
@@ -36,9 +39,14 @@ def _netscape_cookie_file() -> Optional[str]:
 
     Docker bind-mounts a missing source as a *directory* named cookies.txt, which must not be used.
     """
-    if not os.path.isfile(COOKIE_FILE) or os.path.getsize(COOKIE_FILE) == 0:
+    p = COOKIE_FILE_PATH
+    if not p.is_file() or p.stat().st_size == 0:
         return None
-    return COOKIE_FILE
+    return str(p)
+
+
+def _allow_browser_cookies() -> bool:
+    return os.getenv("ALLOW_BROWSER_COOKIES", "0").lower() in {"1", "true", "yes", "on"}
 
 DOWNLOAD_DIR = Path.home() / "Downloads" / "AnyGrab"
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -295,7 +303,7 @@ def extract_with_ytdlp(url: str, platform: str) -> MediaResponse:
     cf = _netscape_cookie_file()
     if cf:
         ydl_opts["cookiefile"] = cf
-    elif platform != "youtube":
+    elif platform != "youtube" and _allow_browser_cookies():
         ydl_opts["cookiesfrombrowser"] = ("brave",)
 
     try:
@@ -389,10 +397,14 @@ def _get_instagram_session() -> Session:
             return s
         except Exception as e:
             log.warning("cookies.txt could not be read (%s), trying browser cookies", e)
-    jar = extract_cookies_from_browser("brave")
-    for c in jar:
-        if "instagram" in c.domain:
-            s.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
+    if _allow_browser_cookies():
+        try:
+            jar = extract_cookies_from_browser("brave")
+            for c in jar:
+                if "instagram" in c.domain:
+                    s.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
+        except Exception as e:
+            log.warning("Could not extract browser cookies: %s", e)
     return s
 
 def extract_instagram(url: str) -> MediaResponse:
@@ -558,7 +570,7 @@ async def _ytdlp_stream_download(request: DownloadRequest, platform: str) -> Opt
     cf = _netscape_cookie_file()
     if cf:
         ydl_opts["cookiefile"] = cf
-    elif platform != "youtube":
+    elif platform != "youtube" and _allow_browser_cookies():
         ydl_opts["cookiesfrombrowser"] = ("brave",)
 
     try:
@@ -743,7 +755,7 @@ async def _save_via_ytdlp(request: SaveRequest, filepath: Path, platform: str) -
     cf = _netscape_cookie_file()
     if cf:
         ydl_opts["cookiefile"] = cf
-    elif platform != "youtube":
+    elif platform != "youtube" and _allow_browser_cookies():
         ydl_opts["cookiesfrombrowser"] = ("brave",)
 
     try:
@@ -782,7 +794,31 @@ async def _save_via_proxy(request: SaveRequest, filepath: Path, filename: str) -
 # ---------------------------------------------------------------------------
 @app.get("/api/v1/settings")
 async def get_settings():
-    return {"download_dir": str(DOWNLOAD_DIR)}
+    return {
+        "download_dir": str(DOWNLOAD_DIR),
+        "cookie_file": str(COOKIE_FILE_PATH),
+        "cookies_present": _netscape_cookie_file() is not None,
+    }
+
+
+@app.post("/api/v1/cookies")
+async def upload_cookies(file: UploadFile = File(...)):
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file uploaded")
+    try:
+        content = await file.read()
+    finally:
+        await file.close()
+
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    COOKIE_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    COOKIE_FILE_PATH.write_bytes(content)
+    if not _netscape_cookie_file():
+        raise HTTPException(status_code=400, detail="Invalid cookies file")
+
+    return {"ok": True, "path": str(COOKIE_FILE_PATH)}
 
 @app.get("/api/v1/health")
 async def health():

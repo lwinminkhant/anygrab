@@ -22,6 +22,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const audioToggleWrapper = document.getElementById('audioToggleWrapper');
     const audioOnlyToggle = document.getElementById('audioOnlyToggle');
     const queueIndicator = document.getElementById('queueIndicator');
+    const cookieFileInput = document.getElementById('cookieFileInput');
+    const cookieUploadBtn = document.getElementById('cookieUploadBtn');
+    const cookieStatus = document.getElementById('cookieStatus');
 
     let currentExtractionData = null;
     let activeAbortController = null;
@@ -33,6 +36,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
     fetch('/api/v1/settings').then(r => r.json()).then(data => {
         if (saveFolderDisplay) saveFolderDisplay.textContent = data.download_dir;
+        if (cookieStatus && data.cookies_present) {
+            cookieStatus.textContent = 'Cookies loaded';
+            cookieStatus.classList.add('ok');
+        }
     }).catch(() => {});
 
     function startQueuePolling() {
@@ -103,6 +110,49 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function sleep(ms) {
         return new Promise(r => setTimeout(r, ms));
+    }
+
+    async function uploadCookies() {
+        if (!cookieFileInput || !cookieFileInput.files.length) {
+            showToast('Choose a cookies.txt file first.', true);
+            return;
+        }
+        const file = cookieFileInput.files[0];
+        const formData = new FormData();
+        formData.append('file', file);
+
+        cookieUploadBtn.disabled = true;
+        const prevText = cookieUploadBtn.textContent;
+        cookieUploadBtn.textContent = 'Uploading…';
+        if (cookieStatus) {
+            cookieStatus.textContent = '';
+            cookieStatus.classList.remove('ok');
+        }
+
+        try {
+            const resp = await fetch('/api/v1/cookies', {
+                method: 'POST',
+                body: formData,
+            });
+            const data = await resp.json();
+            if (!resp.ok || !data.ok) {
+                throw new Error(data.detail || 'Upload failed');
+            }
+            showToast('Cookies uploaded successfully.', false);
+            if (cookieStatus) {
+                cookieStatus.textContent = 'Cookies loaded';
+                cookieStatus.classList.add('ok');
+            }
+        } catch (err) {
+            showToast(err.message || 'Upload failed.', true);
+            if (cookieStatus) {
+                cookieStatus.textContent = 'Upload error';
+                cookieStatus.classList.remove('ok');
+            }
+        } finally {
+            cookieUploadBtn.disabled = false;
+            cookieUploadBtn.textContent = prevText;
+        }
     }
 
     function cancelActiveRequest() {
@@ -324,4 +374,8 @@ document.addEventListener('DOMContentLoaded', () => {
     urlInput.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') extractBtn.click();
     });
+
+    if (cookieUploadBtn) {
+        cookieUploadBtn.addEventListener('click', uploadCookies);
+    }
 });
