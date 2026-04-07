@@ -9,3 +9,4 @@ aiosqlite
 aiohttp
 pyrogram
 tgcrypto
+python-multipart
