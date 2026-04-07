@@ -36,23 +36,5 @@ services:
       api:
         condition: service_healthy
 
-  # HTTPS on anygrab.lwinminkhant.pro — requires DNS pointing here and ports 80/443 open.
-  caddy:
-    image: caddy:2-alpine
-    container_name: anygrab-caddy
-    restart: unless-stopped
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy-data:/data
-      - caddy-config:/config
-    depends_on:
-      api:
-        condition: service_healthy
-
 volumes:
   bot-data:
-  caddy-data:
-  caddy-config:
