@@ -295,6 +295,40 @@ def _run_ytdlp_extract_with_fallback(url: str, ydl_opts: dict) -> dict:
             return _run_ytdlp_extract(url, retry_opts)
         raise
 
+
+def _merge_extractor_args(base: dict, extra: dict) -> dict:
+    merged = dict(base or {})
+    for key, value in (extra or {}).items():
+        current = merged.get(key, {})
+        next_value = dict(current) if isinstance(current, dict) else {}
+        next_value.update(value)
+        merged[key] = next_value
+    return merged
+
+
+def _youtube_public_ydl_variants(base_opts: dict) -> list[dict]:
+    variants = [dict(base_opts)]
+
+    no_imp = dict(base_opts)
+    no_imp.pop("impersonate", None)
+    variants.append(no_imp)
+
+    v_android = dict(no_imp)
+    v_android["extractor_args"] = _merge_extractor_args(
+        v_android.get("extractor_args", {}),
+        {"youtube": {"player_client": ["android", "ios", "mweb"]}},
+    )
+    variants.append(v_android)
+
+    v_tv = dict(no_imp)
+    v_tv["extractor_args"] = _merge_extractor_args(
+        v_tv.get("extractor_args", {}),
+        {"youtube": {"player_client": ["tv_embedded", "android"]}},
+    )
+    variants.append(v_tv)
+
+    return variants
+
 def _build_media_response(info: dict, platform: str) -> MediaResponse:
     caption = info.get("description") or info.get("title")
     media_urls = []
@@ -330,31 +364,29 @@ def extract_with_ytdlp(url: str, platform: str) -> MediaResponse:
         "impersonate": ImpersonateTarget(client="chrome"),
     }
 
-    cf = _netscape_cookie_file()
-    if cf:
-        ydl_opts["cookiefile"] = cf
-
     try:
-        info = _run_ytdlp_extract_with_fallback(url, ydl_opts)
-    except Exception as first_err:
         if platform == "youtube":
-            log.info("YouTube first attempt failed (%s), retrying without cookies…", first_err)
-            retry_opts = {
-                "skip_download": True,
-                "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-                "impersonate": ImpersonateTarget(client="chrome"),
-            }
-            try:
-                info = _run_ytdlp_extract_with_fallback(url, retry_opts)
-            except Exception as retry_err:
-                log.error("YouTube retry failed: %s", traceback.format_exc())
-                raise HTTPException(status_code=400, detail=f"Failed to extract youtube data: {retry_err}")
-        elif platform == "tiktok":
+            last_err = None
+            for idx, variant in enumerate(_youtube_public_ydl_variants(ydl_opts), start=1):
+                try:
+                    info = _run_ytdlp_extract_with_fallback(url, variant)
+                    break
+                except Exception as e:
+                    last_err = e
+                    log.info("YouTube public extraction strategy %s failed: %s", idx, e)
+            else:
+                raise HTTPException(status_code=400, detail=f"Failed to extract youtube data: {last_err}")
+        else:
+            cf = _netscape_cookie_file()
+            if cf:
+                ydl_opts["cookiefile"] = cf
+            info = _run_ytdlp_extract_with_fallback(url, ydl_opts)
+    except Exception as first_err:
+        if platform == "tiktok":
             log.info("yt-dlp TikTok failed, trying fallback: %s", first_err)
             return extract_tiktok_fallback(url)
-        else:
-            log.error("Extraction error: %s", traceback.format_exc())
-            raise HTTPException(status_code=400, detail=f"Failed to extract {platform} data: {first_err}")
+        log.error("Extraction error: %s", traceback.format_exc())
+        raise HTTPException(status_code=400, detail=f"Failed to extract {platform} data: {first_err}")
 
     return _build_media_response(info, platform)
 
@@ -587,24 +619,26 @@ async def _ytdlp_stream_download(request: DownloadRequest, platform: str) -> Opt
             "concurrent_fragment_downloads": 8,
         }
 
-    cf = _netscape_cookie_file()
-    if cf:
-        ydl_opts["cookiefile"] = cf
+    if platform != "youtube":
+        cf = _netscape_cookie_file()
+        if cf:
+            ydl_opts["cookiefile"] = cf
 
     try:
         def download_video():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            variants = _youtube_public_ydl_variants(ydl_opts) if platform == "youtube" else [ydl_opts]
+            last_err = None
+            for variant in variants:
                 try:
-                    ydl.download([request.original_url])
+                    with yt_dlp.YoutubeDL(variant) as ydl:
+                        ydl.download([request.original_url])
+                    return
                 except Exception as e:
-                    if ydl_opts.get("impersonate") and _is_impersonation_unavailable_error(e):
+                    last_err = e
+                    if variant.get("impersonate") and _is_impersonation_unavailable_error(e):
                         _warn_impersonation_unavailable_once(e)
-                        retry_opts = dict(ydl_opts)
-                        retry_opts.pop("impersonate", None)
-                        with yt_dlp.YoutubeDL(retry_opts) as ydl_retry:
-                            ydl_retry.download([request.original_url])
-                    else:
-                        raise
+            if last_err:
+                raise last_err
 
         await asyncio.to_thread(download_video)
 
@@ -780,24 +814,26 @@ async def _save_via_ytdlp(request: SaveRequest, filepath: Path, platform: str) -
             "concurrent_fragment_downloads": 8,
         }
 
-    cf = _netscape_cookie_file()
-    if cf:
-        ydl_opts["cookiefile"] = cf
+    if platform != "youtube":
+        cf = _netscape_cookie_file()
+        if cf:
+            ydl_opts["cookiefile"] = cf
 
     try:
         def dl():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            variants = _youtube_public_ydl_variants(ydl_opts) if platform == "youtube" else [ydl_opts]
+            last_err = None
+            for variant in variants:
                 try:
-                    ydl.download([request.original_url])
+                    with yt_dlp.YoutubeDL(variant) as ydl:
+                        ydl.download([request.original_url])
+                    return
                 except Exception as e:
-                    if ydl_opts.get("impersonate") and _is_impersonation_unavailable_error(e):
+                    last_err = e
+                    if variant.get("impersonate") and _is_impersonation_unavailable_error(e):
                         _warn_impersonation_unavailable_once(e)
-                        retry_opts = dict(ydl_opts)
-                        retry_opts.pop("impersonate", None)
-                        with yt_dlp.YoutubeDL(retry_opts) as ydl_retry:
-                            ydl_retry.download([request.original_url])
-                    else:
-                        raise
+            if last_err:
+                raise last_err
 
         await asyncio.to_thread(dl)
 

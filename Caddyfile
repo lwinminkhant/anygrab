@@ -1,6 +1,0 @@
-# Point DNS A/AAAA for 	 to this host before starting Caddy
-# (Let's Encrypt needs port 80 reachable from the internet).
-
-anygrab.lwinminkhant.pro {
-	reverse_proxy api:8000
-}
