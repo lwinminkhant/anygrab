@@ -23,10 +23,10 @@ from curl_cffi.requests import AsyncSession, Session
 from pydantic import BaseModel
 import yt_dlp
 from yt_dlp.networking.impersonate import ImpersonateTarget
-from yt_dlp.cookies import extract_cookies_from_browser
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("anygrab")
+_warned_impersonation_unavailable = False
 
 # Accept either an absolute COOKIE_FILE path or a path relative to this repo.
 _COOKIE_FILE_ENV = os.getenv("COOKIE_FILE", "cookies.txt")
@@ -45,8 +45,26 @@ def _netscape_cookie_file() -> Optional[str]:
     return str(p)
 
 
-def _allow_browser_cookies() -> bool:
-    return os.getenv("ALLOW_BROWSER_COOKIES", "0").lower() in {"1", "true", "yes", "on"}
+def _is_impersonation_unavailable_error(err: Exception) -> bool:
+    msg = str(err).lower()
+    return "impersonate target" in msg and "not available" in msg
+
+
+def _warn_impersonation_unavailable_once(err: Exception):
+    global _warned_impersonation_unavailable
+    if not _warned_impersonation_unavailable:
+        log.warning("Impersonation target unavailable, falling back to default client: %s", err)
+        _warned_impersonation_unavailable = True
+
+
+def _new_session() -> Session:
+    try:
+        return Session(impersonate="chrome")
+    except Exception as e:
+        if _is_impersonation_unavailable_error(e):
+            _warn_impersonation_unavailable_once(e)
+            return Session()
+        raise
 
 DOWNLOAD_DIR = Path.home() / "Downloads" / "AnyGrab"
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -265,6 +283,18 @@ def _run_ytdlp_extract(url: str, ydl_opts: dict) -> dict:
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=False)
 
+
+def _run_ytdlp_extract_with_fallback(url: str, ydl_opts: dict) -> dict:
+    try:
+        return _run_ytdlp_extract(url, ydl_opts)
+    except Exception as e:
+        if ydl_opts.get("impersonate") and _is_impersonation_unavailable_error(e):
+            _warn_impersonation_unavailable_once(e)
+            retry_opts = dict(ydl_opts)
+            retry_opts.pop("impersonate", None)
+            return _run_ytdlp_extract(url, retry_opts)
+        raise
+
 def _build_media_response(info: dict, platform: str) -> MediaResponse:
     caption = info.get("description") or info.get("title")
     media_urls = []
@@ -303,11 +333,9 @@ def extract_with_ytdlp(url: str, platform: str) -> MediaResponse:
     cf = _netscape_cookie_file()
     if cf:
         ydl_opts["cookiefile"] = cf
-    elif platform != "youtube" and _allow_browser_cookies():
-        ydl_opts["cookiesfrombrowser"] = ("brave",)
 
     try:
-        info = _run_ytdlp_extract(url, ydl_opts)
+        info = _run_ytdlp_extract_with_fallback(url, ydl_opts)
     except Exception as first_err:
         if platform == "youtube":
             log.info("YouTube first attempt failed (%s), retrying without cookies…", first_err)
@@ -317,7 +345,7 @@ def extract_with_ytdlp(url: str, platform: str) -> MediaResponse:
                 "impersonate": ImpersonateTarget(client="chrome"),
             }
             try:
-                info = _run_ytdlp_extract(url, retry_opts)
+                info = _run_ytdlp_extract_with_fallback(url, retry_opts)
             except Exception as retry_err:
                 log.error("YouTube retry failed: %s", traceback.format_exc())
                 raise HTTPException(status_code=400, detail=f"Failed to extract youtube data: {retry_err}")
@@ -332,7 +360,7 @@ def extract_with_ytdlp(url: str, platform: str) -> MediaResponse:
 
 def extract_tiktok_fallback(url: str) -> MediaResponse:
     try:
-        s = Session(impersonate="chrome")
+        s = _new_session()
         resp = s.get(f"https://www.tikwm.com/api/?url={url}&hd=1", timeout=15)
         resp.raise_for_status()
         data = resp.json()
@@ -386,7 +414,7 @@ def _shortcode_to_media_id(shortcode: str) -> str:
     return str(media_id)
 
 def _get_instagram_session() -> Session:
-    s = Session(impersonate="chrome")
+    s = _new_session()
     p = _netscape_cookie_file()
     if p:
         try:
@@ -396,15 +424,7 @@ def _get_instagram_session() -> Session:
                 s.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
             return s
         except Exception as e:
-            log.warning("cookies.txt could not be read (%s), trying browser cookies", e)
-    if _allow_browser_cookies():
-        try:
-            jar = extract_cookies_from_browser("brave")
-            for c in jar:
-                if "instagram" in c.domain:
-                    s.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
-        except Exception as e:
-            log.warning("Could not extract browser cookies: %s", e)
+            log.warning("cookies.txt could not be read (%s)", e)
     return s
 
 def extract_instagram(url: str) -> MediaResponse:
@@ -570,13 +590,21 @@ async def _ytdlp_stream_download(request: DownloadRequest, platform: str) -> Opt
     cf = _netscape_cookie_file()
     if cf:
         ydl_opts["cookiefile"] = cf
-    elif platform != "youtube" and _allow_browser_cookies():
-        ydl_opts["cookiesfrombrowser"] = ("brave",)
 
     try:
         def download_video():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([request.original_url])
+                try:
+                    ydl.download([request.original_url])
+                except Exception as e:
+                    if ydl_opts.get("impersonate") and _is_impersonation_unavailable_error(e):
+                        _warn_impersonation_unavailable_once(e)
+                        retry_opts = dict(ydl_opts)
+                        retry_opts.pop("impersonate", None)
+                        with yt_dlp.YoutubeDL(retry_opts) as ydl_retry:
+                            ydl_retry.download([request.original_url])
+                    else:
+                        raise
 
         await asyncio.to_thread(download_video)
 
@@ -618,7 +646,7 @@ async def _ytdlp_stream_download(request: DownloadRequest, platform: str) -> Opt
 
 async def _proxy_stream_download(request: DownloadRequest) -> StreamingResponse:
     try:
-        async with AsyncSession(impersonate="chrome") as session:
+        async with AsyncSession() as session:
             head_resp = await session.head(request.url, headers=request.headers, timeout=10)
             if head_resp.status_code not in (200, 206):
                 raise HTTPException(status_code=502, detail=f"Media server returned {head_resp.status_code}. Download unavailable.")
@@ -628,7 +656,7 @@ async def _proxy_stream_download(request: DownloadRequest) -> StreamingResponse:
         file_ext = "jpg" if is_image else "mp4"
 
         async def stream_generator():
-            async with AsyncSession(impersonate="chrome") as session:
+            async with AsyncSession() as session:
                 async with session.stream("GET", request.url, headers=request.headers) as response:
                     async for chunk in response.aiter_content():
                         yield chunk
@@ -646,7 +674,7 @@ async def _proxy_stream_download(request: DownloadRequest) -> StreamingResponse:
 
 async def _download_tiktok_fallback(tiktok_url: str) -> StreamingResponse:
     def fetch_api():
-        s = Session(impersonate="chrome")
+        s = _new_session()
         api_resp = s.get(f"https://www.tikwm.com/api/?url={tiktok_url}&hd=1", timeout=15)
         api_resp.raise_for_status()
         return api_resp.json()
@@ -661,7 +689,7 @@ async def _download_tiktok_fallback(tiktok_url: str) -> StreamingResponse:
         raise ValueError("No video URL from tikwm")
 
     async def stream_generator():
-        async with AsyncSession(impersonate="chrome") as session:
+        async with AsyncSession() as session:
             async with session.stream("GET", video_url) as response:
                 async for chunk in response.aiter_content():
                     yield chunk
@@ -712,7 +740,7 @@ async def save_to_disk(request: SaveRequest):
 
 async def _save_tiktok_fallback(request: SaveRequest, filepath: Path, filename: str) -> Optional[SaveResponse]:
     def fetch_api():
-        s = Session(impersonate="chrome")
+        s = _new_session()
         api_resp = s.get(f"https://www.tikwm.com/api/?url={request.original_url}&hd=1", timeout=15)
         api_resp.raise_for_status()
         return api_resp.json()
@@ -725,7 +753,7 @@ async def _save_tiktok_fallback(request: SaveRequest, filepath: Path, filename: 
     if not video_url:
         return None
 
-    async with AsyncSession(impersonate="chrome") as session:
+    async with AsyncSession() as session:
         resp = await session.get(video_url, timeout=60)
         filepath.write_bytes(resp.content)
         return SaveResponse(success=True, filename=filename, path=str(filepath), size=len(resp.content))
@@ -755,13 +783,21 @@ async def _save_via_ytdlp(request: SaveRequest, filepath: Path, platform: str) -
     cf = _netscape_cookie_file()
     if cf:
         ydl_opts["cookiefile"] = cf
-    elif platform != "youtube" and _allow_browser_cookies():
-        ydl_opts["cookiesfrombrowser"] = ("brave",)
 
     try:
         def dl():
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([request.original_url])
+                try:
+                    ydl.download([request.original_url])
+                except Exception as e:
+                    if ydl_opts.get("impersonate") and _is_impersonation_unavailable_error(e):
+                        _warn_impersonation_unavailable_once(e)
+                        retry_opts = dict(ydl_opts)
+                        retry_opts.pop("impersonate", None)
+                        with yt_dlp.YoutubeDL(retry_opts) as ydl_retry:
+                            ydl_retry.download([request.original_url])
+                    else:
+                        raise
 
         await asyncio.to_thread(dl)
 
@@ -777,7 +813,7 @@ async def _save_via_ytdlp(request: SaveRequest, filepath: Path, platform: str) -
 
 async def _save_via_proxy(request: SaveRequest, filepath: Path, filename: str) -> SaveResponse:
     try:
-        async with AsyncSession(impersonate="chrome") as session:
+        async with AsyncSession() as session:
             resp = await session.get(request.url, headers=request.headers, timeout=60)
             if resp.status_code not in (200, 206):
                 raise HTTPException(status_code=502, detail=f"Media server returned {resp.status_code}")
