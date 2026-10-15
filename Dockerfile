@@ -1,5 +1,8 @@
 FROM python:3.12-slim
 
+# yt-dlp uses Deno with its bundled EJS package for YouTube player challenges.
+COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
+
 WORKDIR /app
 
 COPY requirements.txt requirements-transcription.txt ./

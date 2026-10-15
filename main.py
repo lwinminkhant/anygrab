@@ -5,12 +5,13 @@ import time
 import tempfile
 import uuid
 import asyncio
+import anyio
 import glob as glob_module
 import hashlib
 import logging
 from dotenv import load_dotenv
 from collections import OrderedDict
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import List, Optional, Dict, Any
 from pathlib import Path
 
@@ -27,6 +28,7 @@ import yt_dlp
 from yt_dlp.networking.impersonate import ImpersonateTarget
 from account_api import router as account_router, shutdown_accounts
 from learning_api import router as learning_router, shutdown_learning
+from media_source import VIDEO_DOWNLOAD_FORMAT as _VIDEO_DOWNLOAD_FORMAT
 from public_media_safety import (SafeYoutubeDL, PublicSession, PublicAsyncSession,
                                  validate_url, validate_headers, safe_download_path)
 
@@ -334,7 +336,7 @@ def get_platform(url: str) -> str:
                  if any(host == item or host.endswith("." + item) for item in hosts)), "unknown")
 
 def _run_ytdlp_extract(url: str, ydl_opts: dict) -> dict:
-    with SafeYoutubeDL(ydl_opts) as ydl:
+    with SafeYoutubeDL(ydl_opts, single_video=get_platform(url) == "youtube") as ydl:
         return ydl.extract_info(url, download=False)
 
 
@@ -360,20 +362,14 @@ def _merge_extractor_args(base: dict, extra: dict) -> dict:
     return merged
 
 
-# Clients that work unauthenticated in yt-dlp's INNERTUBE_CLIENTS table. "tv_embedded" is NOT one of
-# them -- it was silently dropped ("Skipping unsupported client"), so the old 4th variant was dead config.
-_YOUTUBE_FALLBACK_CLIENTS = ["tv", "web_safari", "android_vr"]
+# Keep yt-dlp's maintained defaults; Safari may additionally expose combined HLS.
+# android_vr now requires PO tokens for its HTTPS formats and is no longer a default.
+_YOUTUBE_FALLBACK_CLIENTS = ["default", "web_safari"]
+_YOUTUBE_PREVIEW_FORMAT = "best[vcodec^=h264]/best[vcodec^=avc]/best/bestvideo[vcodec^=avc]/bestvideo"
 
 
 def _youtube_public_ydl_variants(base_opts: dict) -> list[dict]:
-    """Cookie-free extraction strategies, cheapest first.
-
-    Measured against the live API: YouTube's "Sign in to confirm you're not a bot" gate is keyed on IP
-    reputation, not on client choice -- when it trips, every player_client fails alike; when it does not,
-    the default client already succeeds. Extra variants therefore bought no additional successes and only
-    added latency (the old android/ios/mweb variant alone cost ~10s), so the chain is two entries:
-    the fast default, then one genuinely different fingerprint for per-client quirks such as age gating.
-    """
+    """Try maintained defaults, then add Safari without replacing those defaults."""
     variants = [dict(base_opts)]
 
     v_alt = dict(base_opts)
@@ -429,11 +425,12 @@ def _youtube_failure_detail(err: Optional[Exception]) -> str:
     return f"Failed to extract youtube data: {err}"
 
 
-def extract_with_ytdlp(url: str, platform: str) -> MediaResponse:
+def extract_with_ytdlp(url: str, platform: str, *, allow_tiktok_fallback: bool = True) -> MediaResponse:
     validate_url(url, source=True)
     ydl_opts = _apply_common_ydl_opts({
         "skip_download": True,
-        "format": "best[vcodec^=h264]/best[vcodec^=avc]/best",
+        "noplaylist": True,
+        "format": _YOUTUBE_PREVIEW_FORMAT if platform == "youtube" else "best[vcodec^=h264]/best[vcodec^=avc]/best",
         "impersonate": ImpersonateTarget(client="chrome"),
     })
 
@@ -455,7 +452,7 @@ def extract_with_ytdlp(url: str, platform: str) -> MediaResponse:
         # Already a deliberate, caller-facing message -- re-wrapping would nest it ("...: 400: ...").
         raise
     except Exception as first_err:
-        if platform == "tiktok":
+        if platform == "tiktok" and allow_tiktok_fallback:
             log.info("yt-dlp TikTok failed, trying fallback: %s", first_err)
             return extract_tiktok_fallback(url)
         log.error("Extraction error: %s", traceback.format_exc())
@@ -466,10 +463,10 @@ def extract_with_ytdlp(url: str, platform: str) -> MediaResponse:
 def extract_tiktok_fallback(url: str) -> MediaResponse:
     validate_url(url, source=True)
     try:
-        s = _new_session()
-        resp = s.get(f"https://www.tikwm.com/api/?url={url}&hd=1", timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
+        with _new_session() as session:
+            resp = session.get("https://www.tikwm.com/api/", params={"url": url, "hd": 1}, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
 
         if data.get("code") != 0:
             raise ValueError(f"tikwm API error: {data.get('msg', 'unknown')}")
@@ -623,8 +620,14 @@ async def extract_social_media(request: URLRequest):
                 except Exception as e:
                     log.info("yt-dlp Instagram failed, trying API fallback: %s", e)
                     result = await asyncio.to_thread(extract_instagram, request.url)
-            elif platform == "tiktok" and "/photo/" in request.url:
-                result = await asyncio.to_thread(extract_tiktok_fallback, request.url)
+            elif platform == "tiktok":
+                try:
+                    result = await asyncio.to_thread(extract_tiktok_fallback, request.url)
+                except HTTPException:
+                    log.info("TikTok provider unavailable, trying direct extraction")
+                    result = await asyncio.to_thread(
+                        extract_with_ytdlp, request.url, platform, allow_tiktok_fallback=False,
+                    )
             else:
                 result = await asyncio.to_thread(extract_with_ytdlp, request.url, platform)
 
@@ -642,16 +645,15 @@ async def proxy_download(request: DownloadRequest):
     async with _download_semaphore:
         _active_downloads += 1
         try:
-            if platform == "tiktok" and request.original_url:
-                try:
-                    return await _download_tiktok_fallback(request.original_url)
-                except Exception as e:
-                    log.info("TikTok tikwm download failed: %s, trying yt-dlp…", e)
+            if platform in ("instagram", "tiktok"):
+                return await _proxy_stream_download(request)
 
             if request.original_url:
                 result = await _ytdlp_stream_download(request, platform)
                 if result is not None:
                     return result
+                if platform == "youtube":
+                    raise HTTPException(status_code=502, detail="YouTube could not provide a complete download. Please retry.")
 
             return await _proxy_stream_download(request)
         finally:
@@ -674,7 +676,7 @@ async def _ytdlp_stream_download(request: DownloadRequest, platform: str) -> Opt
         }
     else:
         ydl_opts = {
-            "format": "bestvideo[ext=mp4][vcodec^=avc1]+140/best[vcodec^=h264]/best[vcodec^=avc]/best",
+            "format": _VIDEO_DOWNLOAD_FORMAT,
             "merge_output_format": "mp4",
             "noplaylist": True,
             "outtmpl": filepath_base + ".%(ext)s",
@@ -690,7 +692,7 @@ async def _ytdlp_stream_download(request: DownloadRequest, platform: str) -> Opt
             last_err = None
             for variant in variants:
                 try:
-                    with SafeYoutubeDL(variant) as ydl:
+                    with SafeYoutubeDL(variant, single_video=platform == "youtube") as ydl:
                         ydl.download([request.original_url])
                     return
                 except Exception as e:
@@ -740,61 +742,63 @@ async def _ytdlp_stream_download(request: DownloadRequest, platform: str) -> Opt
     return None
 
 
-async def _proxy_stream_download(request: DownloadRequest) -> StreamingResponse:
-    try:
-        async with _new_async_session() as session:
-            head_resp = await session.head(request.url, headers=request.headers, timeout=10)
-            if head_resp.status_code not in (200, 206):
-                raise HTTPException(status_code=502, detail=f"Media server returned {head_resp.status_code}. Download unavailable.")
+class _ClosingStreamingResponse(StreamingResponse):
+    def __init__(self, *args, resources: AsyncExitStack, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._resources = resources
 
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            with anyio.CancelScope(shield=True):
+                await self._resources.aclose()
+
+
+async def _proxy_stream_download(request: DownloadRequest) -> StreamingResponse:
+    resources = AsyncExitStack()
+    try:
+        session = await resources.enter_async_context(_new_async_session())
+        response = await resources.enter_async_context(
+            session.stream("GET", request.url, headers=request.headers, timeout=60)
+        )
+        if response.status_code not in (200, 206):
+            raise HTTPException(status_code=502, detail=f"Media server returned {response.status_code}. Download unavailable.")
         is_image = any(ext in request.url.lower() for ext in (".jpg", ".jpeg", ".png", ".webp"))
-        media_type = "image/jpeg" if is_image else "video/mp4"
-        file_ext = "jpg" if is_image else "mp4"
+        media_type = response.headers.get("Content-Type", "").partition(";")[0].strip().lower()
+        if not media_type or media_type == "application/octet-stream":
+            media_type = "image/jpeg" if is_image else "video/mp4"
+        if not media_type.startswith(("image/", "video/", "audio/")):
+            raise HTTPException(status_code=502, detail="Media server did not return a media file.")
+        extensions = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp",
+                      "image/gif": "gif", "image/avif": "avif", "audio/mp4": "m4a",
+                      "audio/mpeg": "mp3", "video/webm": "webm", "video/quicktime": "mov"}
+        file_ext = extensions.get(media_type, "jpg" if is_image else "mp4")
+        headers = {"Content-Disposition": f"attachment; filename=media.{file_ext}"}
+        length = response.headers.get("Content-Length", "")
+        if length.isdigit() and not response.headers.get("Content-Encoding"):
+            headers["Content-Length"] = length
 
         async def stream_generator():
-            async with _new_async_session() as session:
-                async with session.stream("GET", request.url, headers=request.headers) as response:
-                    async for chunk in response.aiter_content():
-                        yield chunk
-
-        return StreamingResponse(
-            stream_generator(),
-            media_type=media_type,
-            headers={"Content-Disposition": f"attachment; filename=media.{file_ext}"},
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Download failed: {e}")
-
-
-async def _download_tiktok_fallback(tiktok_url: str) -> StreamingResponse:
-    def fetch_api():
-        s = _new_session()
-        api_resp = s.get(f"https://www.tikwm.com/api/?url={tiktok_url}&hd=1", timeout=15)
-        api_resp.raise_for_status()
-        return api_resp.json()
-
-    data = await asyncio.to_thread(fetch_api)
-
-    if data.get("code") != 0:
-        raise ValueError(f"tikwm API error: {data.get('msg')}")
-
-    video_url = data["data"].get("hdplay") or data["data"].get("play")
-    if not video_url:
-        raise ValueError("No video URL from tikwm")
-
-    async def stream_generator():
-        async with _new_async_session() as session:
-            async with session.stream("GET", video_url) as response:
+            try:
                 async for chunk in response.aiter_content():
                     yield chunk
+            finally:
+                with anyio.CancelScope(shield=True):
+                    await resources.aclose()
 
-    return StreamingResponse(
-        stream_generator(),
-        media_type="video/mp4",
-        headers={"Content-Disposition": "attachment; filename=video.mp4"},
-    )
+        return _ClosingStreamingResponse(
+            stream_generator(),
+            resources=resources,
+            media_type=media_type,
+            headers=headers,
+        )
+    except BaseException as error:
+        with anyio.CancelScope(shield=True):
+            await resources.aclose()
+        if isinstance(error, HTTPException) or not isinstance(error, Exception):
+            raise
+        raise HTTPException(status_code=502, detail="The media file could not be downloaded. Please retry.") from error
 
 
 @app.get("/api/v1/download")
@@ -819,43 +823,19 @@ async def save_to_disk(request: SaveRequest):
     async with _download_semaphore:
         _active_downloads += 1
         try:
-            if platform == "tiktok" and request.original_url and not is_image:
-                try:
-                    result = await _save_tiktok_fallback(request, filepath, filename)
-                    if result:
-                        return result
-                except Exception as e:
-                    log.info("TikTok tikwm save failed: %s, trying yt-dlp…", e)
+            if platform in ("instagram", "tiktok"):
+                return await _save_via_proxy(request, filepath, filename)
 
             if request.original_url and not is_image:
                 result = await _save_via_ytdlp(request, filepath, platform)
                 if result:
                     return result
+                if platform == "youtube":
+                    raise HTTPException(status_code=502, detail="YouTube could not provide a complete download. Please retry.")
 
             return await _save_via_proxy(request, filepath, filename)
         finally:
             _active_downloads -= 1
-
-
-async def _save_tiktok_fallback(request: SaveRequest, filepath: Path, filename: str) -> Optional[SaveResponse]:
-    def fetch_api():
-        s = _new_session()
-        api_resp = s.get(f"https://www.tikwm.com/api/?url={request.original_url}&hd=1", timeout=15)
-        api_resp.raise_for_status()
-        return api_resp.json()
-
-    data = await asyncio.to_thread(fetch_api)
-    if data.get("code") != 0:
-        return None
-
-    video_url = data["data"].get("hdplay") or data["data"].get("play")
-    if not video_url:
-        return None
-
-    async with _new_async_session() as session:
-        resp = await session.get(video_url, timeout=60)
-        filepath.write_bytes(resp.content)
-        return SaveResponse(success=True, filename=filename, path=str(filepath), size=len(resp.content))
 
 
 async def _save_via_ytdlp(request: SaveRequest, filepath: Path, platform: str) -> Optional[SaveResponse]:
@@ -870,7 +850,7 @@ async def _save_via_ytdlp(request: SaveRequest, filepath: Path, platform: str) -
         }
     else:
         ydl_opts = {
-            "format": "bestvideo[ext=mp4][vcodec^=avc1]+140/best[vcodec^=h264]/best[vcodec^=avc]/best",
+            "format": _VIDEO_DOWNLOAD_FORMAT,
             "merge_output_format": "mp4",
             "noplaylist": True,
             "outtmpl": str(filepath.with_suffix(".%(ext)s")),
@@ -886,7 +866,7 @@ async def _save_via_ytdlp(request: SaveRequest, filepath: Path, platform: str) -
             last_err = None
             for variant in variants:
                 try:
-                    with SafeYoutubeDL(variant) as ydl:
+                    with SafeYoutubeDL(variant, single_video=platform == "youtube") as ydl:
                         ydl.download([request.original_url])
                     return
                 except Exception as e:

@@ -1,6 +1,6 @@
 fastapi>=0.104.1
 uvicorn>=0.24.0
-yt-dlp
+yt-dlp[default]>=2026.8.19
 pydantic>=2.5.2
 curl_cffi
 python-dotenv

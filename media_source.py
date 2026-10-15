@@ -22,6 +22,10 @@ SUPPORTED_HOSTS = (
 MAX_MEDIA_BYTES = int(os.getenv('ACCOUNT_MAX_MEDIA_BYTES', str(200 * 1024 * 1024)))
 MAX_MEDIA_DURATION = int(os.getenv('ACCOUNT_MAX_MEDIA_DURATION', '7200'))
 MAX_DOWNLOAD_SECONDS = min(300, max(1, int(os.getenv('ACCOUNT_DOWNLOAD_TIMEOUT', '300'))))
+VIDEO_DOWNLOAD_FORMAT = (
+    'bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/'
+    'best[vcodec^=h264]/best[vcodec^=avc]/best/bestvideo+bestaudio'
+)
 CDN_HOSTS = ('cdninstagram.com', 'fbcdn.net', 'tiktokcdn.com', 'tiktokcdn-us.com', 'tiktokcdn-eu.com', 'ibytedtos.com', 'byteoversea.com', 'tikwm.com', 'akamaized.net')
 
 
@@ -60,6 +64,8 @@ def _bounded_progress(progress):
 @contextmanager
 def downloaded_source(source_url, media_index=0, audio_only=False):
     source_url = validate_source_url(source_url)
+    host = (urlsplit(source_url).hostname or '').lower()
+    youtube = any(host == domain or host.endswith('.' + domain) for domain in ('youtube.com', 'youtu.be'))
     if isinstance(media_index, bool) or not isinstance(media_index, int) or not 0 <= media_index <= 99:
         raise ValueError('Choose a valid media item.')
     started = time.monotonic()
@@ -74,7 +80,8 @@ def downloaded_source(source_url, media_index=0, audio_only=False):
             'socket_timeout': 30, 'retries': 1, 'extractor_retries': 1,
             'max_filesize': MAX_MEDIA_BYTES, 'progress_hooks': [progress],
             'outtmpl': str(Path(directory) / '%(id)s.%(ext)s'),
-            'format': 'bestaudio/best' if audio_only else 'best[ext=mp4]/best',
+            'format': 'bestaudio/best' if audio_only else (VIDEO_DOWNLOAD_FORMAT if youtube else 'best[ext=mp4]/best'),
+            'merge_output_format': 'mp4',
             'cachedir': False, 'restrictfilenames': True,
             'allowed_extractors': ['(?!Generic).*'],
         }

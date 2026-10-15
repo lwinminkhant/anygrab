@@ -2,11 +2,12 @@
 import ipaddress
 from pathlib import Path
 import socket
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 from urllib.request import BaseHandler
 
 import yt_dlp
 from yt_dlp.networking._urllib import UrllibRH
+from instagram_media import InstagramMediaIE
 
 SOURCE_HOSTS = ('youtube.com', 'youtu.be', 'tiktok.com', 'instagram.com', 'facebook.com', 'fb.watch', 'twitter.com', 'x.com')
 MEDIA_HOSTS = SOURCE_HOSTS + (
@@ -17,6 +18,23 @@ MEDIA_HOSTS = SOURCE_HOSTS + (
     'musical.ly', 'tikwm.com', 'akamaized.net', 'twimg.com',
 )
 SAFE_HEADERS = frozenset(('user-agent', 'referer', 'accept', 'accept-language', 'accept-encoding', 'range', 'origin', 'sec-fetch-mode'))
+
+
+def _validate_youtube_source(parsed):
+    host = (parsed.hostname or '').lower()
+    parts = parsed.path.strip('/').split('/')
+    if host == 'youtu.be' or host.endswith('.youtu.be'):
+        single_video = len(parts) == 1 and bool(parts[0])
+    elif host == 'youtube.com' or host.endswith('.youtube.com'):
+        single_video = (
+            parts == ['watch'] and bool(parse_qs(parsed.query).get('v', [''])[0])
+            or (len(parts) == 2 and parts[0] in ('shorts', 'embed', 'live', 'v', 'clip')
+                and bool(parts[1]) and parts[1] != 'videoseries')
+        )
+    else:
+        return
+    if not single_video:
+        raise ValueError('Use a single YouTube video link, not a channel or playlist.')
 
 
 def validate_url(value, *, source=False):
@@ -33,6 +51,8 @@ def validate_url(value, *, source=False):
             or port not in (None, 80 if parsed.scheme == 'http' else 443)
             or not any(host == domain or host.endswith('.' + domain) for domain in allowed)):
         raise ValueError('Only supported public media hosts are allowed.')
+    if source:
+        _validate_youtube_source(parsed)
     try:
         addresses = socket.getaddrinfo(host, port or (443 if parsed.scheme == 'https' else 80))
         if not addresses or any(not ipaddress.ip_address(item[4][0]).is_global for item in addresses):
@@ -82,10 +102,18 @@ class PublicUrllibRH(UrllibRH):
 
 
 class SafeYoutubeDL(yt_dlp.YoutubeDL):
-    def __init__(self, params=None, *args, **kwargs):
+    def __init__(self, params=None, *args, single_video=False, **kwargs):
+        self._single_video = single_video
         options = {**(params or {}), 'allowed_extractors': ['(?!Generic).*'], 'enable_file_urls': False}
         options.pop('impersonate', None)
         super().__init__(options, *args, **kwargs)
+        self.add_info_extractor(InstagramMediaIE())
+
+    def process_ie_result(self, ie_result, download=True, extra_info=None):
+        # This also runs for URL results resolved recursively by yt-dlp.
+        if self._single_video and ie_result.get('_type') in ('playlist', 'multi_video'):
+            raise yt_dlp.utils.DownloadError('Use a single YouTube video link, not a channel or playlist.')
+        return super().process_ie_result(ie_result, download, extra_info)
 
     def build_request_director(self, handlers, preferences=None):
         # A single guarded HTTP transport covers API calls, media and redirects.
