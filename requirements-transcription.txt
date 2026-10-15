@@ -1,0 +1,2 @@
+# Optional local speech recognition. Model weights are downloaded on first use.
+faster-whisper>=1.2,<2

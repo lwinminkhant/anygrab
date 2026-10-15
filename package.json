@@ -1,0 +1,16 @@
+{
+  "name": "anygrab",
+  "version": "1.0.0",
+  "description": "Universal social media downloader",
+  "scripts": {
+    "dev": "./.venv/bin/python main.py",
+    "start": "./.venv/bin/python main.py",
+    "bot": "./.venv/bin/python telegram_bot.py",
+    "test": "playwright test",
+    "test:ui": "playwright test --ui"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.13.0",
+    "@playwright/test": "^1.64.0"
+  }
+}

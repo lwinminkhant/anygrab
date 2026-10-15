@@ -42,3 +42,17 @@ test.mp4
 AnyGrab_*.mp4
 AnyGrab_*.mp3
 AnyGrab_*.jpg
+.gstack/
+
+# Frontend dependencies and browser verification artifacts
+node_modules/
+test-results/
+playwright-report/
+.playwright-mcp/
+.impeccable/review/
+data/
+.data/
+.coverage
+htmlcov/
+coverage.xml
+.pytest_cache/

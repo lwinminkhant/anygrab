@@ -1,7 +1,6 @@
 import os
 import re
 import traceback
-import http.cookiejar
 import time
 import tempfile
 import uuid
@@ -9,41 +8,31 @@ import asyncio
 import glob as glob_module
 import hashlib
 import logging
+from dotenv import load_dotenv
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from typing import List, Optional, Dict, Any
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Request, Response, UploadFile, File
+load_dotenv()
+
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from curl_cffi.requests import AsyncSession, Session
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 import yt_dlp
 from yt_dlp.networking.impersonate import ImpersonateTarget
+from account_api import router as account_router, shutdown_accounts
+from learning_api import router as learning_router, shutdown_learning
+from public_media_safety import (SafeYoutubeDL, PublicSession, PublicAsyncSession,
+                                 validate_url, validate_headers, safe_download_path)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("anygrab")
 _warned_impersonation_unavailable = False
-
-# Accept either an absolute COOKIE_FILE path or a path relative to this repo.
-_COOKIE_FILE_ENV = os.getenv("COOKIE_FILE", "cookies.txt")
-_BASE_DIR = Path(__file__).resolve().parent
-COOKIE_FILE_PATH = (Path(_COOKIE_FILE_ENV) if os.path.isabs(_COOKIE_FILE_ENV) else (_BASE_DIR / _COOKIE_FILE_ENV)).resolve()
-
-
-def _netscape_cookie_file() -> Optional[str]:
-    """Return cookies.txt path only if it is a non-empty regular file.
-
-    Docker bind-mounts a missing source as a *directory* named cookies.txt, which must not be used.
-    """
-    p = COOKIE_FILE_PATH
-    if not p.is_file() or p.stat().st_size == 0:
-        return None
-    return str(p)
-
 
 def _is_impersonation_unavailable_error(err: Exception) -> bool:
     msg = str(err).lower()
@@ -57,14 +46,50 @@ def _warn_impersonation_unavailable_once(err: Exception):
         _warned_impersonation_unavailable = True
 
 
-def _new_session() -> Session:
+COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt")
+PROXY_URL = os.getenv("PROXY_URL", "").strip() or None
+
+
+def _has_valid_cookies(cookie_path: Optional[str] = None) -> bool:
+    path = cookie_path or COOKIES_FILE
+    if not path or not os.path.isfile(path):
+        return False
     try:
-        return Session(impersonate="chrome")
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _apply_common_ydl_opts(opts: dict) -> dict:
+    updated = dict(opts)
+    if PROXY_URL:
+        updated["proxy"] = PROXY_URL
+    if _has_valid_cookies():
+        updated["cookiefile"] = COOKIES_FILE
+    return updated
+
+
+def _new_session(**kwargs) -> Session:
+    if PROXY_URL and "proxy" not in kwargs:
+        kwargs["proxy"] = PROXY_URL
+    try:
+        return PublicSession(impersonate="chrome", **kwargs)
     except Exception as e:
         if _is_impersonation_unavailable_error(e):
             _warn_impersonation_unavailable_once(e)
-            return Session()
+            return PublicSession(**kwargs)
         raise
+
+
+def _new_async_session(**kwargs) -> AsyncSession:
+    if PROXY_URL and "proxy" not in kwargs:
+        kwargs["proxy"] = PROXY_URL
+    return PublicAsyncSession(**kwargs)
 
 DOWNLOAD_DIR = Path.home() / "Downloads" / "AnyGrab"
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -161,14 +186,20 @@ async def lifespan(app: FastAPI):
     global _extract_semaphore, _download_semaphore
     _extract_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EXTRACTIONS)
     _download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
+    cookie_status = "active" if _has_valid_cookies() else "none"
+    proxy_status = "active" if PROXY_URL else "none"
     log.info(
-        "AnyGrab ready  |  extractions=%d  downloads=%d  cache=%ds/%d  rate=%d/%ds",
+        "AnyGrab ready  |  extractions=%d  downloads=%d  cache=%ds/%d  rate=%d/%ds  cookies=%s  proxy=%s",
         MAX_CONCURRENT_EXTRACTIONS, MAX_CONCURRENT_DOWNLOADS,
         CACHE_TTL_SECONDS, CACHE_MAX_SIZE,
         RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW,
+        cookie_status, proxy_status,
     )
-    yield
-    log.info("AnyGrab shutting down")
+    try:
+        yield
+    finally:
+        await asyncio.gather(shutdown_learning(), shutdown_accounts())
+        log.info("AnyGrab shutting down")
 
 _PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
 _fastapi_kw: Dict[str, Any] = {
@@ -180,6 +211,8 @@ if _PUBLIC_URL:
     _fastapi_kw["servers"] = [{"url": _PUBLIC_URL, "description": "Public"}]
 
 app = FastAPI(**_fastapi_kw)
+app.include_router(account_router)
+app.include_router(learning_router)
 
 _cors_origins = os.getenv("CORS_ORIGINS", "*").strip()
 if _cors_origins == "*":
@@ -189,7 +222,7 @@ else:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allow_origins,
-    allow_credentials=True,
+    allow_credentials=_allow_origins != ["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -222,7 +255,9 @@ async def rate_limit_and_timeout(request: Request, call_next):
                 headers={"Retry-After": str(RATE_LIMIT_WINDOW)},
             )
         try:
-            return await asyncio.wait_for(call_next(request), timeout=REQUEST_TIMEOUT)
+            # Account downloads include a bounded source fetch and a Drive upload.
+            timeout = max(REQUEST_TIMEOUT, 600) if request.url.path == "/api/v1/drive" else REQUEST_TIMEOUT
+            return await asyncio.wait_for(call_next(request), timeout=timeout)
         except asyncio.TimeoutError:
             return JSONResponse({"detail": "Request timed out."}, status_code=504)
 
@@ -234,11 +269,31 @@ async def rate_limit_and_timeout(request: Request, call_next):
 class URLRequest(BaseModel):
     url: str
 
+    @field_validator("url")
+    @classmethod
+    def public_source(cls, value):
+        return validate_url(value, source=True)
+
 class DownloadRequest(BaseModel):
     url: str
     headers: Dict[str, str] = {}
     original_url: Optional[str] = None
     audio_only: bool = False
+
+    @field_validator("url")
+    @classmethod
+    def public_media(cls, value):
+        return validate_url(value)
+
+    @field_validator("original_url")
+    @classmethod
+    def public_source(cls, value):
+        return validate_url(value, source=True) if value is not None else None
+
+    @field_validator("headers")
+    @classmethod
+    def media_headers(cls, value):
+        return validate_headers(value)
 
 class MediaResponse(BaseModel):
     platform: str
@@ -247,12 +302,15 @@ class MediaResponse(BaseModel):
     metadata: Dict[str, Any]
     http_headers: Dict[str, str] = {}
 
-class SaveRequest(BaseModel):
-    url: str
-    headers: Dict[str, str] = {}
-    original_url: Optional[str] = None
+class SaveRequest(DownloadRequest):
     filename: Optional[str] = None
-    audio_only: bool = False
+
+    @field_validator("filename")
+    @classmethod
+    def safe_filename(cls, value):
+        if value is not None:
+            safe_download_path(DOWNLOAD_DIR, value)
+        return value
 
 class SaveResponse(BaseModel):
     success: bool
@@ -267,20 +325,16 @@ def _cache_key(url: str) -> str:
     return hashlib.sha256(url.encode()).hexdigest()
 
 def get_platform(url: str) -> str:
-    if "youtube.com" in url or "youtu.be" in url:
-        return "youtube"
-    if "tiktok.com" in url:
-        return "tiktok"
-    if "twitter.com" in url or "x.com" in url:
-        return "x"
-    if "facebook.com" in url or "fb.watch" in url:
-        return "facebook"
-    if "instagram.com" in url:
-        return "instagram"
-    return "unknown"
+    from urllib.parse import urlsplit
+    host = (urlsplit(url).hostname or "").lower()
+    domains = {"youtube": ("youtube.com", "youtu.be"), "tiktok": ("tiktok.com",),
+               "x": ("twitter.com", "x.com"), "facebook": ("facebook.com", "fb.watch"),
+               "instagram": ("instagram.com",)}
+    return next((platform for platform, hosts in domains.items()
+                 if any(host == item or host.endswith("." + item) for item in hosts)), "unknown")
 
 def _run_ytdlp_extract(url: str, ydl_opts: dict) -> dict:
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    with SafeYoutubeDL(ydl_opts) as ydl:
         return ydl.extract_info(url, download=False)
 
 
@@ -306,26 +360,29 @@ def _merge_extractor_args(base: dict, extra: dict) -> dict:
     return merged
 
 
+# Clients that work unauthenticated in yt-dlp's INNERTUBE_CLIENTS table. "tv_embedded" is NOT one of
+# them -- it was silently dropped ("Skipping unsupported client"), so the old 4th variant was dead config.
+_YOUTUBE_FALLBACK_CLIENTS = ["tv", "web_safari", "android_vr"]
+
+
 def _youtube_public_ydl_variants(base_opts: dict) -> list[dict]:
+    """Cookie-free extraction strategies, cheapest first.
+
+    Measured against the live API: YouTube's "Sign in to confirm you're not a bot" gate is keyed on IP
+    reputation, not on client choice -- when it trips, every player_client fails alike; when it does not,
+    the default client already succeeds. Extra variants therefore bought no additional successes and only
+    added latency (the old android/ios/mweb variant alone cost ~10s), so the chain is two entries:
+    the fast default, then one genuinely different fingerprint for per-client quirks such as age gating.
+    """
     variants = [dict(base_opts)]
 
-    no_imp = dict(base_opts)
-    no_imp.pop("impersonate", None)
-    variants.append(no_imp)
-
-    v_android = dict(no_imp)
-    v_android["extractor_args"] = _merge_extractor_args(
-        v_android.get("extractor_args", {}),
-        {"youtube": {"player_client": ["android", "ios", "mweb"]}},
+    v_alt = dict(base_opts)
+    v_alt.pop("impersonate", None)
+    v_alt["extractor_args"] = _merge_extractor_args(
+        v_alt.get("extractor_args", {}),
+        {"youtube": {"player_client": _YOUTUBE_FALLBACK_CLIENTS}},
     )
-    variants.append(v_android)
-
-    v_tv = dict(no_imp)
-    v_tv["extractor_args"] = _merge_extractor_args(
-        v_tv.get("extractor_args", {}),
-        {"youtube": {"player_client": ["tv_embedded", "android"]}},
-    )
-    variants.append(v_tv)
+    variants.append(v_alt)
 
     return variants
 
@@ -357,12 +414,28 @@ def _build_media_response(info: dict, platform: str) -> MediaResponse:
         http_headers=info.get("http_headers", {}),
     )
 
+def _youtube_failure_detail(err: Optional[Exception]) -> str:
+    """Turn yt-dlp's failure into advice that matches how this service runs."""
+    if err is not None and "not a bot" in str(err).lower():
+        if _has_valid_cookies():
+            return (
+                "YouTube bot check failed even with cookies. The exported cookies may have expired, "
+                "or YouTube is blocking this IP address. Please refresh cookies.txt or route via PROXY_URL."
+            )
+        return (
+            "YouTube is rate-limiting this server's IP address (bot check). "
+            "Please export cookies from YouTube into cookies.txt, or configure a residential PROXY_URL in .env."
+        )
+    return f"Failed to extract youtube data: {err}"
+
+
 def extract_with_ytdlp(url: str, platform: str) -> MediaResponse:
-    ydl_opts = {
+    validate_url(url, source=True)
+    ydl_opts = _apply_common_ydl_opts({
         "skip_download": True,
         "format": "best[vcodec^=h264]/best[vcodec^=avc]/best",
         "impersonate": ImpersonateTarget(client="chrome"),
-    }
+    })
 
     try:
         if platform == "youtube":
@@ -375,12 +448,12 @@ def extract_with_ytdlp(url: str, platform: str) -> MediaResponse:
                     last_err = e
                     log.info("YouTube public extraction strategy %s failed: %s", idx, e)
             else:
-                raise HTTPException(status_code=400, detail=f"Failed to extract youtube data: {last_err}")
+                raise HTTPException(status_code=400, detail=_youtube_failure_detail(last_err))
         else:
-            cf = _netscape_cookie_file()
-            if cf:
-                ydl_opts["cookiefile"] = cf
             info = _run_ytdlp_extract_with_fallback(url, ydl_opts)
+    except HTTPException:
+        # Already a deliberate, caller-facing message -- re-wrapping would nest it ("...: 400: ...").
+        raise
     except Exception as first_err:
         if platform == "tiktok":
             log.info("yt-dlp TikTok failed, trying fallback: %s", first_err)
@@ -391,6 +464,7 @@ def extract_with_ytdlp(url: str, platform: str) -> MediaResponse:
     return _build_media_response(info, platform)
 
 def extract_tiktok_fallback(url: str) -> MediaResponse:
+    validate_url(url, source=True)
     try:
         s = _new_session()
         resp = s.get(f"https://www.tikwm.com/api/?url={url}&hd=1", timeout=15)
@@ -446,20 +520,10 @@ def _shortcode_to_media_id(shortcode: str) -> str:
     return str(media_id)
 
 def _get_instagram_session() -> Session:
-    s = _new_session()
-    p = _netscape_cookie_file()
-    if p:
-        try:
-            cookie_jar = http.cookiejar.MozillaCookieJar(p)
-            cookie_jar.load(ignore_discard=True, ignore_expires=True)
-            for c in cookie_jar:
-                s.cookies.set(c.name, c.value, domain=c.domain, path=c.path)
-            return s
-        except Exception as e:
-            log.warning("cookies.txt could not be read (%s)", e)
-    return s
+    return _new_session()
 
 def extract_instagram(url: str) -> MediaResponse:
+    validate_url(url, source=True)
     match = re.search(r"(?:p|reel|tv)/([^/?#&]+)", url)
     if not match:
         raise HTTPException(status_code=400, detail="Invalid Instagram URL. Must be a post or reel.")
@@ -618,11 +682,7 @@ async def _ytdlp_stream_download(request: DownloadRequest, platform: str) -> Opt
             "impersonate": ImpersonateTarget(client="chrome"),
             "concurrent_fragment_downloads": 8,
         }
-
-    if platform != "youtube":
-        cf = _netscape_cookie_file()
-        if cf:
-            ydl_opts["cookiefile"] = cf
+    ydl_opts = _apply_common_ydl_opts(ydl_opts)
 
     try:
         def download_video():
@@ -630,7 +690,7 @@ async def _ytdlp_stream_download(request: DownloadRequest, platform: str) -> Opt
             last_err = None
             for variant in variants:
                 try:
-                    with yt_dlp.YoutubeDL(variant) as ydl:
+                    with SafeYoutubeDL(variant) as ydl:
                         ydl.download([request.original_url])
                     return
                 except Exception as e:
@@ -642,45 +702,47 @@ async def _ytdlp_stream_download(request: DownloadRequest, platform: str) -> Opt
 
         await asyncio.to_thread(download_video)
 
-        actual_files = glob_module.glob(filepath_base + ".*")
-        actual_file = actual_files[0] if actual_files else None
+        candidates = glob_module.glob(f"{filepath_base}.*")
+        if not candidates:
+            return None
 
-        if actual_file and os.path.getsize(actual_file) > 0:
-            ext = os.path.splitext(actual_file)[1].lstrip(".")
-            mime_map = {
-                "mp4": "video/mp4", "webm": "video/webm", "mp3": "audio/mpeg",
-                "m4a": "audio/mp4", "jpg": "image/jpeg", "jpeg": "image/jpeg",
-                "png": "image/png", "webp": "image/webp",
-            }
-            media_type = mime_map.get(ext, "application/octet-stream")
-            dl_filename = "audio" if request.audio_only else "media"
-            file_size = os.path.getsize(actual_file)
+        actual_file = candidates[0]
+        ext = os.path.splitext(actual_file)[1].lstrip(".")
+        media_type = "audio/mp4" if ext == "m4a" else ("audio/mpeg" if ext == "mp3" else "video/mp4")
 
-            async def file_streamer():
-                try:
-                    with open(actual_file, "rb") as f:
-                        while chunk := f.read(1024 * 256):
-                            yield chunk
-                finally:
-                    _cleanup_files(filepath_base + ".*")
+        def iterfile():
+            try:
+                with open(actual_file, "rb") as f:
+                    while chunk := f.read(64 * 1024):
+                        yield chunk
+            finally:
+                for f in glob_module.glob(f"{filepath_base}.*"):
+                    try:
+                        os.remove(f)
+                    except OSError:
+                        pass
 
-            return StreamingResponse(
-                file_streamer(),
-                media_type=media_type,
-                headers={
-                    "Content-Disposition": f"attachment; filename={dl_filename}.{ext}",
-                    "Content-Length": str(file_size),
-                },
-            )
+        return StreamingResponse(
+            iterfile(),
+            media_type=media_type,
+            headers={
+                "Content-Disposition": f"attachment; filename=media.{ext}",
+                "Content-Length": str(os.path.getsize(actual_file)),
+            },
+        )
     except Exception as e:
-        _cleanup_files(filepath_base + ".*")
+        for f in glob_module.glob(f"{filepath_base}.*"):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
         log.warning("yt-dlp download failed: %s", e)
     return None
 
 
 async def _proxy_stream_download(request: DownloadRequest) -> StreamingResponse:
     try:
-        async with AsyncSession() as session:
+        async with _new_async_session() as session:
             head_resp = await session.head(request.url, headers=request.headers, timeout=10)
             if head_resp.status_code not in (200, 206):
                 raise HTTPException(status_code=502, detail=f"Media server returned {head_resp.status_code}. Download unavailable.")
@@ -690,7 +752,7 @@ async def _proxy_stream_download(request: DownloadRequest) -> StreamingResponse:
         file_ext = "jpg" if is_image else "mp4"
 
         async def stream_generator():
-            async with AsyncSession() as session:
+            async with _new_async_session() as session:
                 async with session.stream("GET", request.url, headers=request.headers) as response:
                     async for chunk in response.aiter_content():
                         yield chunk
@@ -723,7 +785,7 @@ async def _download_tiktok_fallback(tiktok_url: str) -> StreamingResponse:
         raise ValueError("No video URL from tikwm")
 
     async def stream_generator():
-        async with AsyncSession() as session:
+        async with _new_async_session() as session:
             async with session.stream("GET", video_url) as response:
                 async for chunk in response.aiter_content():
                     yield chunk
@@ -737,7 +799,10 @@ async def _download_tiktok_fallback(tiktok_url: str) -> StreamingResponse:
 
 @app.get("/api/v1/download")
 async def proxy_download_get(url: str, original_url: Optional[str] = None):
-    req = DownloadRequest(url=url, original_url=original_url)
+    try:
+        req = DownloadRequest(url=url, original_url=original_url)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Enter a supported public media URL.") from None
     return await proxy_download(req)
 
 
@@ -749,7 +814,7 @@ async def save_to_disk(request: SaveRequest):
     is_image = any(ext in request.url.lower() for ext in (".jpg", ".jpeg", ".png", ".webp"))
     default_ext = "mp3" if request.audio_only else ("jpg" if is_image else "mp4")
     filename = request.filename or f"AnyGrab_{ts}.{default_ext}"
-    filepath = DOWNLOAD_DIR / filename
+    filepath = safe_download_path(DOWNLOAD_DIR, filename)
 
     async with _download_semaphore:
         _active_downloads += 1
@@ -787,7 +852,7 @@ async def _save_tiktok_fallback(request: SaveRequest, filepath: Path, filename: 
     if not video_url:
         return None
 
-    async with AsyncSession() as session:
+    async with _new_async_session() as session:
         resp = await session.get(video_url, timeout=60)
         filepath.write_bytes(resp.content)
         return SaveResponse(success=True, filename=filename, path=str(filepath), size=len(resp.content))
@@ -813,11 +878,7 @@ async def _save_via_ytdlp(request: SaveRequest, filepath: Path, platform: str) -
             "impersonate": ImpersonateTarget(client="chrome"),
             "concurrent_fragment_downloads": 8,
         }
-
-    if platform != "youtube":
-        cf = _netscape_cookie_file()
-        if cf:
-            ydl_opts["cookiefile"] = cf
+    ydl_opts = _apply_common_ydl_opts(ydl_opts)
 
     try:
         def dl():
@@ -825,7 +886,7 @@ async def _save_via_ytdlp(request: SaveRequest, filepath: Path, platform: str) -
             last_err = None
             for variant in variants:
                 try:
-                    with yt_dlp.YoutubeDL(variant) as ydl:
+                    with SafeYoutubeDL(variant) as ydl:
                         ydl.download([request.original_url])
                     return
                 except Exception as e:
@@ -849,7 +910,7 @@ async def _save_via_ytdlp(request: SaveRequest, filepath: Path, platform: str) -
 
 async def _save_via_proxy(request: SaveRequest, filepath: Path, filename: str) -> SaveResponse:
     try:
-        async with AsyncSession() as session:
+        async with _new_async_session() as session:
             resp = await session.get(request.url, headers=request.headers, timeout=60)
             if resp.status_code not in (200, 206):
                 raise HTTPException(status_code=502, detail=f"Media server returned {resp.status_code}")
@@ -868,29 +929,8 @@ async def _save_via_proxy(request: SaveRequest, filepath: Path, filename: str) -
 async def get_settings():
     return {
         "download_dir": str(DOWNLOAD_DIR),
-        "cookie_file": str(COOKIE_FILE_PATH),
-        "cookies_present": _netscape_cookie_file() is not None,
     }
 
-
-@app.post("/api/v1/cookies")
-async def upload_cookies(file: UploadFile = File(...)):
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="No file uploaded")
-    try:
-        content = await file.read()
-    finally:
-        await file.close()
-
-    if not content:
-        raise HTTPException(status_code=400, detail="Empty file")
-
-    COOKIE_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    COOKIE_FILE_PATH.write_bytes(content)
-    if not _netscape_cookie_file():
-        raise HTTPException(status_code=400, detail="Invalid cookies file")
-
-    return {"ok": True, "path": str(COOKIE_FILE_PATH)}
 
 @app.get("/api/v1/health")
 async def health():
@@ -929,11 +969,18 @@ app.mount("/", StaticFiles(directory="public"), name="public")
 if __name__ == "__main__":
     import uvicorn
 
+    try:
+        port = int(os.getenv("PORT", "8000"))
+    except ValueError:
+        raise SystemExit("PORT must be an integer between 1 and 65535") from None
+    if not 1 <= port <= 65535:
+        raise SystemExit("PORT must be an integer between 1 and 65535")
+
     workers = int(os.getenv("WORKERS", "1"))
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=8000,
+        port=port,
         workers=workers,
         timeout_keep_alive=30,
         limit_concurrency=100,

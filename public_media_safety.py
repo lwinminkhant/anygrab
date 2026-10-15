@@ -1,0 +1,109 @@
+"""Boundaries for the anonymous public downloader and its outbound redirects."""
+import ipaddress
+from pathlib import Path
+import socket
+from urllib.parse import urlsplit
+from urllib.request import BaseHandler
+
+import yt_dlp
+from yt_dlp.networking._urllib import UrllibRH
+
+SOURCE_HOSTS = ('youtube.com', 'youtu.be', 'tiktok.com', 'instagram.com', 'facebook.com', 'fb.watch', 'twitter.com', 'x.com')
+MEDIA_HOSTS = SOURCE_HOSTS + (
+    'googlevideo.com', 'ytimg.com', 'youtubei.googleapis.com', 'googleapis.com',
+    'cdninstagram.com', 'fbcdn.net', 'tiktokcdn.com', 'tiktokcdn-us.com',
+    'tiktokcdn-eu.com', 'tiktokv.com', 'tiktokv.us', 'ibytedtos.com',
+    'ibyteimg.com', 'byteoversea.com', 'byteoversea.net', 'muscdn.com',
+    'musical.ly', 'tikwm.com', 'akamaized.net', 'twimg.com',
+)
+SAFE_HEADERS = frozenset(('user-agent', 'referer', 'accept', 'accept-language', 'accept-encoding', 'range', 'origin', 'sec-fetch-mode'))
+
+
+def validate_url(value, *, source=False):
+    if not isinstance(value, str) or not value or len(value) > 8192 or '\\' in value or any(ord(char) < 33 for char in value):
+        raise ValueError('Enter a supported public media URL.')
+    try:
+        parsed = urlsplit(value)
+        host = (parsed.hostname or '').lower()
+        port = parsed.port
+    except ValueError:
+        raise ValueError('Enter a supported public media URL.') from None
+    allowed = SOURCE_HOSTS if source else MEDIA_HOSTS
+    if (parsed.scheme not in ('https', 'http') or parsed.username is not None or parsed.password is not None
+            or port not in (None, 80 if parsed.scheme == 'http' else 443)
+            or not any(host == domain or host.endswith('.' + domain) for domain in allowed)):
+        raise ValueError('Only supported public media hosts are allowed.')
+    try:
+        addresses = socket.getaddrinfo(host, port or (443 if parsed.scheme == 'https' else 80))
+        if not addresses or any(not ipaddress.ip_address(item[4][0]).is_global for item in addresses):
+            raise ValueError('Media URLs must resolve to public addresses.')
+    except (OSError, ValueError):
+        raise ValueError('Media URLs must resolve to public addresses.') from None
+    return value
+
+
+def validate_headers(headers):
+    if len(headers) > 16:
+        raise ValueError('Too many media request headers.')
+    for name, value in headers.items():
+        if name.lower() not in SAFE_HEADERS or len(value) > 8192 or any(ord(char) < 32 or ord(char) == 127 for char in value):
+            raise ValueError('Unsupported media request header.')
+        if name.lower() in ('referer', 'origin'):
+            validate_url(value)
+    return dict(headers)
+
+
+def safe_download_path(directory, filename):
+    if not filename or filename in ('.', '..') or len(filename) > 200 or any(char in filename for char in ('/', '\\')) or any(ord(char) < 32 for char in filename):
+        raise ValueError('Use a filename without directory paths.')
+    root = Path(directory).resolve()
+    result = root / filename
+    if result.is_symlink() or result.resolve().parent != root:
+        raise ValueError('The download must stay inside the download directory.')
+    return result
+
+
+class PublicRequestGuard(BaseHandler):
+    # urllib executes request processors again when following a redirect.
+    handler_order = 100
+
+    def http_request(self, request):
+        validate_url(request.full_url)
+        return request
+
+    https_request = http_request
+
+
+class PublicUrllibRH(UrllibRH):
+    def _create_instance(self, *args, **kwargs):
+        opener = super()._create_instance(*args, **kwargs)
+        opener.add_handler(PublicRequestGuard())
+        return opener
+
+
+class SafeYoutubeDL(yt_dlp.YoutubeDL):
+    def __init__(self, params=None, *args, **kwargs):
+        options = {**(params or {}), 'allowed_extractors': ['(?!Generic).*'], 'enable_file_urls': False}
+        options.pop('impersonate', None)
+        super().__init__(options, *args, **kwargs)
+
+    def build_request_director(self, handlers, preferences=None):
+        # A single guarded HTTP transport covers API calls, media and redirects.
+        return super().build_request_director([PublicUrllibRH], preferences=None)
+
+
+# curl does not expose a per-redirect destination validator. Block redirects
+# entirely; yt-dlp's guarded transport handles source short links instead.
+from curl_cffi.requests import Session, AsyncSession
+
+
+class PublicSession(Session):
+    def request(self, method, url, *args, **kwargs):
+        validate_url(url)
+        return super().request(method, url, *args, **{**kwargs, 'allow_redirects': False})
+
+
+class PublicAsyncSession(AsyncSession):
+    async def request(self, method, url, *args, **kwargs):
+        validate_url(url)
+        return await super().request(method, url, *args, **{**kwargs, 'allow_redirects': False})

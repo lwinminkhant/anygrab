@@ -14,3 +14,13 @@ __pycache__/
 
 # Do not bake secrets into the image; empty cookies.txt is created in Dockerfile.
 cookies.txt
+data/
+.data/
+*.db-wal
+*.db-shm
+node_modules/
+test-results/
+playwright-report/
+.playwright-mcp/
+.pytest_cache/
+.coverage

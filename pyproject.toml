@@ -16,4 +16,13 @@ dependencies = [
     "aiohttp",
     "pyrogram",
     "tgcrypto",
+    "python-multipart",
+    "httpx>=0.28,<1",
+    "google-auth>=2.40,<3",
+    "requests>=2.32,<3",
+    "cryptography>=46",
 ]
+
+[project.optional-dependencies]
+transcription = ["faster-whisper>=1.2,<2"]
+test = ["pytest>=8", "pytest-cov>=6"]

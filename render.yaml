@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: anygrab
+    runtime: docker
+    plan: free
+    region: singapore
+    branch: dark
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /api/v1/health
+    autoDeployTrigger: 'off'
+    envVars:
+      - key: PORT
+        value: '10000'
+      - key: WORKERS
+        value: '1'
+      - key: MAX_EXTRACTIONS
+        value: '2'
+      - key: MAX_DOWNLOADS
+        value: '1'
+      - key: CACHE_MAX
+        value: '64'
+      - key: INSTALL_TRANSCRIPTION
+        value: '0'
+      - key: TRANSCRIPTION_ENABLED
+        value: 'false'

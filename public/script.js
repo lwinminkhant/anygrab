@@ -1,5 +1,6 @@
 document.addEventListener('DOMContentLoaded', () => {
     const urlInput = document.getElementById('urlInput');
+    const extractForm = document.getElementById('extractForm');
     const extractBtn = document.getElementById('extractBtn');
     const extractSpinner = document.getElementById('extractSpinner');
     const extractText = extractBtn.querySelector('.btn-text');
@@ -18,15 +19,15 @@ document.addEventListener('DOMContentLoaded', () => {
     const downloadText = downloadBtn.querySelector('.btn-text');
 
     const carouselGallery = document.getElementById('carouselGallery');
-    const saveFolderDisplay = document.getElementById('saveFolder');
+    const chooseFolderBtn = document.getElementById('chooseFolderBtn');
+    const saveFolderName = document.getElementById('saveFolderName');
+    const clearFolderBtn = document.getElementById('clearFolderBtn');
     const audioToggleWrapper = document.getElementById('audioToggleWrapper');
     const audioOnlyToggle = document.getElementById('audioOnlyToggle');
     const queueIndicator = document.getElementById('queueIndicator');
-    const cookieFileInput = document.getElementById('cookieFileInput');
-    const cookieUploadBtn = document.getElementById('cookieUploadBtn');
-    const cookieStatus = document.getElementById('cookieStatus');
 
     let currentExtractionData = null;
+    let currentSourceUrl = null;
     let activeAbortController = null;
 
     const EXTRACT_TIMEOUT_MS = 90_000;
@@ -34,13 +35,211 @@ document.addEventListener('DOMContentLoaded', () => {
     const MAX_RETRIES = 2;
     const RETRY_DELAY_MS = 1500;
 
-    fetch('/api/v1/settings').then(r => r.json()).then(data => {
-        if (saveFolderDisplay) saveFolderDisplay.textContent = data.download_dir;
-        if (cookieStatus && data.cookies_present) {
-            cookieStatus.textContent = 'Cookies loaded';
-            cookieStatus.classList.add('ok');
+    // ── Save-to-folder ──────────────────────────────────────────────────────
+    // The File System Access API needs a secure context (https, or localhost) and is Chromium-only.
+    // Everywhere else the picker stays hidden and media goes to the browser's own download folder.
+    const DIR_HANDLE_KEY = 'saveDirHandle';
+    const IDB_NAME = 'anygrab';
+    const IDB_STORE = 'handles';
+    const supportsDirectoryPicker =
+        typeof window.showDirectoryPicker === 'function' && window.isSecureContext;
+
+    let saveDirHandle = null;
+
+    function openHandleDb() {
+        return new Promise((resolve, reject) => {
+            const req = indexedDB.open(IDB_NAME, 1);
+            req.onupgradeneeded = () => {
+                if (!req.result.objectStoreNames.contains(IDB_STORE)) {
+                    req.result.createObjectStore(IDB_STORE);
+                }
+            };
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+        });
+    }
+
+    async function handleDbOp(mode, run) {
+        const db = await openHandleDb();
+        try {
+            return await new Promise((resolve, reject) => {
+                const tx = db.transaction(IDB_STORE, mode);
+                const req = run(tx.objectStore(IDB_STORE));
+                req.onsuccess = () => resolve(req.result);
+                req.onerror = () => reject(req.error);
+            });
+        } finally {
+            db.close();
         }
-    }).catch(() => {});
+    }
+
+    // A directory handle survives reloads, but its permission grant does not: the browser downgrades
+    // it to "prompt", and re-granting is only allowed from a user gesture. Hence `interactive`.
+    async function hasFolderPermission(handle, interactive) {
+        const opts = { mode: 'readwrite' };
+        if ((await handle.queryPermission(opts)) === 'granted') return true;
+        if (!interactive) return false;
+        return (await handle.requestPermission(opts)) === 'granted';
+    }
+
+    function renderSaveTarget(needsReauth) {
+        if (!saveFolderName) return;
+        if (saveDirHandle) {
+            saveFolderName.textContent = needsReauth
+                ? `${saveDirHandle.name} — click to allow`
+                : saveDirHandle.name;
+            clearFolderBtn.classList.remove('hide');
+        } else {
+            saveFolderName.textContent = supportsDirectoryPicker
+                ? 'Choose folder…'
+                : 'Browser downloads';
+            clearFolderBtn.classList.add('hide');
+        }
+    }
+
+    async function restoreSaveFolder() {
+        if (!supportsDirectoryPicker) {
+            chooseFolderBtn.disabled = true;
+            chooseFolderBtn.title = 'Folder picking needs Chrome or Edge over https/localhost';
+            renderSaveTarget(false);
+            return;
+        }
+        try {
+            const stored = await handleDbOp('readonly', store => store.get(DIR_HANDLE_KEY));
+            if (!stored) return renderSaveTarget(false);
+            saveDirHandle = stored;
+            renderSaveTarget(!(await hasFolderPermission(stored, false)));
+        } catch {
+            renderSaveTarget(false);
+        }
+    }
+
+    async function chooseSaveFolder() {
+        if (!supportsDirectoryPicker) return;
+        let handle;
+        try {
+            handle = await window.showDirectoryPicker({ mode: 'readwrite', startIn: 'downloads' });
+        } catch (err) {
+            if (err.name !== 'AbortError') showToast(`Could not open folder picker: ${err.message}`, true);
+            return;
+        }
+        if (!(await hasFolderPermission(handle, true))) {
+            showToast('Write permission denied for that folder.', true);
+            return;
+        }
+        saveDirHandle = handle;
+        try {
+            await handleDbOp('readwrite', store => store.put(handle, DIR_HANDLE_KEY));
+        } catch {
+            showToast('Folder set, but it could not be remembered for next time.', true);
+        }
+        renderSaveTarget(false);
+        showToast(`Saving to "${handle.name}"`, false);
+    }
+
+    async function clearSaveFolder() {
+        saveDirHandle = null;
+        try {
+            await handleDbOp('readwrite', store => store.delete(DIR_HANDLE_KEY));
+        } catch { /* the in-memory handle is already cleared, which is what matters */ }
+        renderSaveTarget(false);
+        showToast('Using browser downloads.', false);
+    }
+
+    // The server knows the real container format (YouTube audio arrives as .m4a, not .mp3), so trust
+    // its Content-Disposition over anything guessed from the media URL.
+    function extensionFor(response, fallbackExt) {
+        const disposition = response.headers.get('Content-Disposition') || '';
+        const match = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(disposition);
+        if (match) {
+            const ext = match[1].trim().split('.').pop();
+            if (ext && /^[A-Za-z0-9]{1,5}$/.test(ext)) return ext.toLowerCase();
+        }
+        return fallbackExt;
+    }
+
+    async function authorizeSaveFolder() {
+        const folder = saveDirHandle;
+        if (!folder) return null;
+        // Renew permission during the save gesture, before a slow network request can
+        // consume the browser's transient user activation. Keep this handle for the batch.
+        if (!(await hasFolderPermission(folder, true))) {
+            throw new Error(`Permission to write into "${folder.name}" was denied. Choose another folder.`);
+        }
+        renderSaveTarget(false);
+        return folder;
+    }
+
+    async function writeToChosenFolder(response, filename, folder) {
+        const fileHandle = await folder.getFileHandle(filename, { create: true });
+        const writable = await fileHandle.createWritable();
+        try {
+            // Stream straight to disk so a large video never has to sit in memory as a Blob.
+            if (response.body) {
+                await response.body.pipeTo(writable);
+            } else {
+                await writable.write(await response.blob());
+                await writable.close();
+            }
+        } catch (err) {
+            try { await writable.abort(); } catch { /* already closed */ }
+            throw err;
+        }
+        return (await fileHandle.getFile()).size;
+    }
+
+    async function saveViaBrowser(response, filename) {
+        const blob = await response.blob();
+        const objectUrl = URL.createObjectURL(blob);
+        const anchor = document.createElement('a');
+        anchor.href = objectUrl;
+        anchor.download = filename;
+        document.body.appendChild(anchor);
+        anchor.click();
+        anchor.remove();
+        setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+        return blob.size;
+    }
+
+    async function deliverMedia(mediaUrl, baseName, fallbackExt, folder, mediaIndex = 0) {
+        const savedFind = {
+            source_url: currentSourceUrl,
+            title: currentExtractionData.metadata?.title || currentExtractionData.caption || 'Untitled media',
+            platform: currentExtractionData.platform,
+            destination: folder ? 'folder' : 'browser',
+            media_index: mediaIndex,
+            audio_only: audioOnlyToggle.checked,
+        };
+        const response = await fetchWithRetry('/api/v1/download', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                original_url: currentSourceUrl,
+                url: mediaUrl,
+                headers: currentExtractionData.http_headers || {},
+                audio_only: audioOnlyToggle.checked,
+            }),
+        }, DOWNLOAD_TIMEOUT_MS, 1);
+
+        if (!response.ok) {
+            let detail = 'Download failed';
+            try { detail = (await response.json()).detail || detail; } catch { /* not JSON */ }
+            throw new Error(detail);
+        }
+
+        const filename = `${baseName}.${extensionFor(response, fallbackExt)}`;
+
+        // Some proxied paths omit Content-Length, so measure what actually landed on disk.
+        const size = folder
+            ? await writeToChosenFolder(response, filename, folder)
+            : await saveViaBrowser(response, filename);
+        document.dispatchEvent(new CustomEvent('anygrab:saved', { detail: { ...savedFind, filename } }));
+        return { filename, size };
+    }
+
+    chooseFolderBtn.addEventListener('click', chooseSaveFolder);
+    clearFolderBtn.addEventListener('click', clearSaveFolder);
+    restoreSaveFolder();
 
     function startQueuePolling() {
         if (!queueIndicator) return;
@@ -112,49 +311,6 @@ document.addEventListener('DOMContentLoaded', () => {
         return new Promise(r => setTimeout(r, ms));
     }
 
-    async function uploadCookies() {
-        if (!cookieFileInput || !cookieFileInput.files.length) {
-            showToast('Choose a cookies.txt file first.', true);
-            return;
-        }
-        const file = cookieFileInput.files[0];
-        const formData = new FormData();
-        formData.append('file', file);
-
-        cookieUploadBtn.disabled = true;
-        const prevText = cookieUploadBtn.textContent;
-        cookieUploadBtn.textContent = 'Uploading…';
-        if (cookieStatus) {
-            cookieStatus.textContent = '';
-            cookieStatus.classList.remove('ok');
-        }
-
-        try {
-            const resp = await fetch('/api/v1/cookies', {
-                method: 'POST',
-                body: formData,
-            });
-            const data = await resp.json();
-            if (!resp.ok || !data.ok) {
-                throw new Error(data.detail || 'Upload failed');
-            }
-            showToast('Cookies uploaded successfully.', false);
-            if (cookieStatus) {
-                cookieStatus.textContent = 'Cookies loaded';
-                cookieStatus.classList.add('ok');
-            }
-        } catch (err) {
-            showToast(err.message || 'Upload failed.', true);
-            if (cookieStatus) {
-                cookieStatus.textContent = 'Upload error';
-                cookieStatus.classList.remove('ok');
-            }
-        } finally {
-            cookieUploadBtn.disabled = false;
-            cookieUploadBtn.textContent = prevText;
-        }
-    }
-
     function cancelActiveRequest() {
         if (activeAbortController) {
             activeAbortController.abort();
@@ -162,11 +318,52 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    extractBtn.addEventListener('click', async () => {
+    function validateLink(value) {
+        if (!value) return 'Paste a media link to get started.';
+        try {
+            const url = new URL(value);
+            if (url.protocol === 'https:' || url.protocol === 'http:') return null;
+        } catch { /* Give the same guidance for malformed links. */ }
+        return 'Enter a valid link starting with https:// or http://.';
+    }
+
+    function saveActionLabel() {
+        if (!currentExtractionData) return 'Save video';
+        if (audioOnlyToggle.checked) return 'Save audio (MP3)';
+        const urls = currentExtractionData.media_urls;
+        if (urls.length > 1) return `Save all (${urls.length})`;
+        return isImageUrl(urls[0]) ? 'Save photo' : 'Save video';
+    }
+
+    mediaThumbnail.addEventListener('error', () => {
+        if (!mediaThumbnail.src.endsWith('/media-placeholder.svg')) {
+            mediaThumbnail.src = 'media-placeholder.svg';
+        }
+    });
+
+    urlInput.addEventListener('input', () => {
+        urlInput.removeAttribute('aria-invalid');
+        errorBox.classList.add('hide');
+    });
+
+    extractForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        if (extractBtn.disabled) return;
         const url = urlInput.value.trim();
-        if (!url) return;
+        const validationError = validateLink(url);
+        if (validationError) {
+            errorBox.textContent = validationError;
+            errorBox.classList.remove('hide');
+            urlInput.setAttribute('aria-invalid', 'true');
+            urlInput.focus();
+            return;
+        }
 
         cancelActiveRequest();
+        currentExtractionData = null;
+        currentSourceUrl = null;
+        document.dispatchEvent(new CustomEvent('anygrab:media', { detail: null }));
+        urlInput.removeAttribute('aria-invalid');
         errorBox.classList.add('hide');
         resultCard.classList.add('hide');
         carouselGallery.classList.add('hide');
@@ -174,8 +371,9 @@ document.addEventListener('DOMContentLoaded', () => {
         audioToggleWrapper.classList.add('hide');
         audioOnlyToggle.checked = false;
         extractSpinner.classList.remove('hide');
-        extractText.textContent = 'Extracting…';
+        extractText.textContent = 'Finding media…';
         extractBtn.disabled = true;
+        extractBtn.setAttribute('aria-busy', 'true');
 
         try {
             const response = await fetchWithRetry('/api/v1/extract', {
@@ -187,15 +385,23 @@ document.addEventListener('DOMContentLoaded', () => {
             const data = await response.json();
             if (!response.ok) throw new Error(data.detail || 'Extraction failed.');
 
-            currentExtractionData = data;
-            platformBadge.textContent = data.platform;
-            mediaTitle.textContent = data.metadata.title || data.caption || 'Untitled Media';
-            mediaThumbnail.src = data.metadata.thumbnail || data.media_urls[0] || 'https://via.placeholder.com/600x400?text=No+Thumbnail';
+            if (!Array.isArray(data.media_urls) || data.media_urls.length === 0 ||
+                data.media_urls.some(item => typeof item !== 'string' || !item.trim())) {
+                throw new Error('No downloadable media was found. Try another link.');
+            }
 
-            const views = data.metadata.view_count;
-            const likes = data.metadata.like_count || data.metadata.likes;
-            mediaViews.textContent = `👁 ${views ? views.toLocaleString() : 'N/A'}`;
-            mediaLikes.textContent = `❤️ ${likes ? likes.toLocaleString() : 'N/A'}`;
+            currentExtractionData = data;
+            currentSourceUrl = url;
+            const metadata = data.metadata || {};
+            platformBadge.textContent = data.platform;
+            mediaTitle.textContent = metadata.title || data.caption || 'Untitled media';
+            mediaThumbnail.src = metadata.thumbnail ||
+                (isImageUrl(data.media_urls[0]) ? data.media_urls[0] : 'media-placeholder.svg');
+
+            const views = metadata.view_count;
+            const likes = metadata.like_count ?? metadata.likes;
+            mediaViews.textContent = views == null ? 'Not available' : Number(views).toLocaleString('en-US');
+            mediaLikes.textContent = likes == null ? 'Not available' : Number(likes).toLocaleString('en-US');
 
             const isCarousel = data.media_urls.length > 1;
             const isYouTube = data.platform === 'youtube';
@@ -203,29 +409,31 @@ document.addEventListener('DOMContentLoaded', () => {
             if (isYouTube) audioToggleWrapper.classList.remove('hide');
 
             if (isCarousel) {
-                downloadText.textContent = `Save All (${data.media_urls.length})`;
                 renderCarouselGallery(data.media_urls);
-            } else {
-                downloadText.textContent = 'Save to Disk';
             }
+            downloadText.textContent = saveActionLabel();
 
+            document.dispatchEvent(new CustomEvent('anygrab:media', { detail: {
+                source_url: url, title: mediaTitle.textContent, platform: data.platform,
+                media_count: data.media_urls.length, audio_only: audioOnlyToggle.checked,
+            } }));
             resultCard.classList.remove('hide');
+            mediaTitle.focus({ preventScroll: true });
+            resultCard.scrollIntoView({ block: 'nearest' });
         } catch (err) {
             errorBox.textContent = err.message;
             errorBox.classList.remove('hide');
         } finally {
             extractSpinner.classList.add('hide');
-            extractText.textContent = 'Extract';
+            extractText.textContent = 'Find media';
             extractBtn.disabled = false;
+            extractBtn.removeAttribute('aria-busy');
         }
     });
 
     audioOnlyToggle.addEventListener('change', () => {
         if (!currentExtractionData) return;
-        const isCarousel = currentExtractionData.media_urls.length > 1;
-        downloadText.textContent = audioOnlyToggle.checked
-            ? 'Save Audio (MP3)'
-            : isCarousel ? `Save All (${currentExtractionData.media_urls.length})` : 'Save to Disk';
+        downloadText.textContent = saveActionLabel();
     });
 
     function renderCarouselGallery(mediaUrls) {
@@ -240,7 +448,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 vid.src = url;
                 vid.muted = true;
                 vid.loop = true;
-                vid.addEventListener('mouseenter', () => vid.play());
+                vid.preload = 'metadata';
+                vid.addEventListener('mouseenter', () => {
+                    if (!window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+                        vid.play().catch(() => { /* Preview playback may be blocked by the browser. */ });
+                    }
+                });
                 vid.addEventListener('mouseleave', () => { vid.pause(); vid.currentTime = 0; });
                 item.appendChild(vid);
             } else {
@@ -253,9 +466,25 @@ document.addEventListener('DOMContentLoaded', () => {
 
             const btn = document.createElement('button');
             btn.className = 'carousel-download-btn';
-            btn.textContent = `${i + 1}`;
+            btn.type = 'button';
+            btn.textContent = `Save ${i + 1}`;
             btn.title = `Save item ${i + 1}`;
-            btn.addEventListener('click', () => saveSingleItem(url, i));
+            btn.setAttribute('aria-label', `Save item ${i + 1}`);
+            btn.addEventListener('click', async () => {
+                if (downloadBtn.disabled) return;
+                setDownloadBusy(true);
+                btn.disabled = true;
+                try {
+                    const folder = await authorizeSaveFolder();
+                    await saveSingleItem(url, i, folder);
+                } catch (err) {
+                    showToast(`Failed: ${err.message}`, true);
+                }
+                finally {
+                    btn.disabled = false;
+                    setDownloadBusy(false);
+                }
+            });
             item.appendChild(btn);
 
             carouselGallery.appendChild(item);
@@ -273,6 +502,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
         const toast = document.createElement('div');
         toast.className = 'toast' + (isError ? ' toast-error' : '');
+        toast.setAttribute('role', isError ? 'alert' : 'status');
         toast.textContent = message;
         document.body.appendChild(toast);
         requestAnimationFrame(() => toast.classList.add('toast-show'));
@@ -288,94 +518,64 @@ document.addEventListener('DOMContentLoaded', () => {
         return (bytes / 1048576).toFixed(1) + ' MB';
     }
 
-    async function saveSingleItem(mediaUrl, index) {
-        const ext = isImageUrl(mediaUrl) ? 'jpg' : 'mp4';
-        const filename = `AnyGrab_${Date.now()}_${index + 1}.${ext}`;
-        try {
-            const response = await fetchWithRetry('/api/v1/save', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    original_url: urlInput.value,
-                    url: mediaUrl,
-                    headers: currentExtractionData.http_headers || {},
-                    filename,
-                    audio_only: audioOnlyToggle.checked,
-                }),
-            }, DOWNLOAD_TIMEOUT_MS, 1);
+    async function saveSingleItem(mediaUrl, index, folder) {
+        const fallbackExt = isImageUrl(mediaUrl) ? 'jpg' : 'mp4';
+        const baseName = `AnyGrab_${Date.now()}_${index + 1}`;
+        const data = await deliverMedia(mediaUrl, baseName, fallbackExt, folder, index);
+        showToast(`Saved ${data.filename} (${formatSize(data.size)})`, false);
+        return data;
+    }
 
-            const data = await response.json();
-            if (!response.ok) throw new Error(data.detail || 'Save failed');
-            showToast(`Saved ${data.filename} (${formatSize(data.size)})`, false);
-            return data;
-        } catch (err) {
-            showToast(`Failed: ${err.message}`, true);
-            throw err;
+    function setDownloadBusy(busy) {
+        downloadBtn.disabled = busy;
+        downloadBtn.setAttribute('aria-busy', String(busy));
+        extractBtn.disabled = busy;
+        audioOnlyToggle.disabled = busy;
+        chooseFolderBtn.disabled = busy || !supportsDirectoryPicker;
+        clearFolderBtn.disabled = busy;
+    }
+
+    async function saveAllItems(mediaUrls, folder) {
+        downloadText.textContent = `Saving 0/${mediaUrls.length}…`;
+        let completed = 0;
+        const BATCH_SIZE = 3;
+        for (let i = 0; i < mediaUrls.length; i += BATCH_SIZE) {
+            const batch = mediaUrls.slice(i, i + BATCH_SIZE);
+            await Promise.all(batch.map((url, batchIdx) => {
+                const globalIdx = i + batchIdx;
+                return saveSingleItem(url, globalIdx, folder)
+                    .then(() => { completed++; downloadText.textContent = `Saving ${completed}/${mediaUrls.length}…`; })
+                    .catch(err => console.error(`Failed item ${globalIdx + 1}:`, err));
+            }));
         }
+        const partial = completed < mediaUrls.length;
+        showToast(`Saved ${completed}/${mediaUrls.length} files${partial ? '. Try saving the remaining items individually.' : ''}`, partial);
     }
 
     downloadBtn.addEventListener('click', async () => {
-        if (!currentExtractionData) return;
-
+        if (!currentExtractionData || downloadBtn.disabled) return;
         downloadSpinner.classList.remove('hide');
-        downloadBtn.disabled = true;
-
-        const mediaUrls = currentExtractionData.media_urls;
-        const isCarousel = mediaUrls.length > 1;
-
-        if (isCarousel) {
-            downloadText.textContent = `Saving 0/${mediaUrls.length}…`;
-            let completed = 0;
-
-            const BATCH_SIZE = 3;
-            for (let i = 0; i < mediaUrls.length; i += BATCH_SIZE) {
-                const batch = mediaUrls.slice(i, i + BATCH_SIZE);
-                const promises = batch.map((url, batchIdx) => {
-                    const globalIdx = i + batchIdx;
-                    return saveSingleItem(url, globalIdx)
-                        .then(() => { completed++; downloadText.textContent = `Saving ${completed}/${mediaUrls.length}…`; })
-                        .catch(err => console.error(`Failed item ${globalIdx + 1}:`, err));
-                });
-                await Promise.all(promises);
-            }
-
-            showToast(`Saved ${completed}/${mediaUrls.length} files`, completed < mediaUrls.length);
-            downloadText.textContent = `Save All (${mediaUrls.length})`;
-        } else {
-            downloadText.textContent = 'Saving…';
-            try {
-                const ext = audioOnlyToggle.checked ? 'mp3' : (isImageUrl(mediaUrls[0]) ? 'jpg' : 'mp4');
-                const filename = `AnyGrab_${Date.now()}.${ext}`;
-                const response = await fetchWithRetry('/api/v1/save', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        original_url: urlInput.value,
-                        url: mediaUrls[0],
-                        headers: currentExtractionData.http_headers || {},
-                        filename,
-                        audio_only: audioOnlyToggle.checked,
-                    }),
-                }, DOWNLOAD_TIMEOUT_MS, 1);
-
-                const data = await response.json();
-                if (!response.ok) throw new Error(data.detail || 'Save failed');
+        setDownloadBusy(true);
+        downloadText.textContent = 'Saving…';
+        try {
+            const folder = await authorizeSaveFolder();
+            const mediaUrls = currentExtractionData.media_urls;
+            if (mediaUrls.length > 1) {
+                await saveAllItems(mediaUrls, folder);
+            } else {
+                const fallbackExt = audioOnlyToggle.checked
+                    ? 'm4a'
+                    : (isImageUrl(mediaUrls[0]) ? 'jpg' : 'mp4');
+                const data = await deliverMedia(mediaUrls[0], `AnyGrab_${Date.now()}`, fallbackExt, folder);
                 showToast(`Saved ${data.filename} (${formatSize(data.size)})`, false);
-            } catch (err) {
-                showToast(`Failed: ${err.message}`, true);
             }
-            downloadText.textContent = audioOnlyToggle.checked ? 'Save Audio (MP3)' : 'Save to Disk';
+        } catch (err) {
+            showToast(`Failed: ${err.message}`, true);
+        } finally {
+            downloadText.textContent = saveActionLabel();
+            downloadSpinner.classList.add('hide');
+            setDownloadBusy(false);
         }
-
-        downloadSpinner.classList.add('hide');
-        downloadBtn.disabled = false;
     });
 
-    urlInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') extractBtn.click();
-    });
-
-    if (cookieUploadBtn) {
-        cookieUploadBtn.addEventListener('click', uploadCookies);
-    }
 });
