@@ -130,6 +130,9 @@ class SafeYoutubeDL(yt_dlp.YoutubeDL):
         # This also runs for URL results resolved recursively by yt-dlp.
         if self._single_video and ie_result.get('_type') in ('playlist', 'multi_video'):
             raise yt_dlp.utils.DownloadError('Use a single YouTube video link, not a channel or playlist.')
+        if self._single_video and (ie_result.get('is_live') is True or ie_result.get('live_status') == 'is_live'):
+            raise yt_dlp.utils.DownloadError(
+                'YouTube livestream is still running. Use a finished video or wait for the stream to end.')
         return super().process_ie_result(ie_result, download, extra_info)
 
     def build_request_director(self, handlers, preferences=None):

@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, Mock
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+import yt_dlp
 from fastapi import HTTPException
 from fastapi.responses import Response
 from fastapi.testclient import TestClient
@@ -77,6 +78,8 @@ def fixture_extractor(monkeypatch):
             return {
                 "id": video_id, "title": "Fixture video", "url": MEDIA_URL,
                 "ext": "mp4", "vcodec": "h264", "acodec": "aac",
+                **({"is_live": True} if query.get("fixture_live") == ["true"] else {}),
+                **({"live_status": "is_live"} if query.get("fixture_live") == ["status"] else {}),
             }
 
     class FixtureYoutubeDL(SafeYoutubeDL):
@@ -207,6 +210,38 @@ def test_other_platform_carousels_still_include_every_item(fixture_extractor):
     assert response.media_urls == [MEDIA_URL, MEDIA_URL]
     assert extracted_videos == [VIDEO_ID, "dFkQydVNXRQ"]
     assert yielded_entries == [VIDEO_ID, "dFkQydVNXRQ"]
+
+
+@pytest.mark.parametrize("marker", ["true", "status"])
+def test_api_rejects_ongoing_youtube_livestream(marker, fixture_extractor):
+    url = f"https://www.youtube.com/watch?v={VIDEO_ID}&fixture_live={marker}"
+    with TestClient(main.app, base_url="http://localhost") as client:
+        response = client.post("/api/v1/extract", json={"url": url})
+    assert response.status_code == 400, response.text
+    assert "YouTube livestream is still running" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("live_fields", [{"is_live": True}, {"live_status": "is_live"}])
+def test_livestream_download_rejected_before_media_processing(live_fields, monkeypatch):
+    process = Mock(side_effect=AssertionError("An ongoing stream must never begin downloading"))
+    monkeypatch.setattr(yt_dlp.YoutubeDL, "process_ie_result", process)
+    with SafeYoutubeDL({"quiet": True}, single_video=True, auto_init=False) as downloader:
+        with pytest.raises(DownloadError, match="YouTube livestream is still running"):
+            downloader.process_ie_result({"id": VIDEO_ID, **live_fields}, download=True)
+    process.assert_not_called()
+
+
+@pytest.mark.parametrize(("single_video", "fields"), [
+    (True, {"is_live": False, "live_status": "was_live"}),
+    (True, {"is_live": False, "live_status": "not_live"}),
+    (False, {"is_live": True, "live_status": "is_live"}),
+])
+def test_finished_streams_and_other_platform_processing_remain_available(single_video, fields, monkeypatch):
+    process = Mock(return_value="processed")
+    monkeypatch.setattr(yt_dlp.YoutubeDL, "process_ie_result", process)
+    with SafeYoutubeDL({"quiet": True}, single_video=single_video, auto_init=False) as downloader:
+        assert downloader.process_ie_result({"id": VIDEO_ID, **fields}, download=True) == "processed"
+    process.assert_called_once()
 
 
 @pytest.mark.parametrize("url", COLLECTION_URLS)
