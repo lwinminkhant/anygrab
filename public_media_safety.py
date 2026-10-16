@@ -1,5 +1,6 @@
 """Boundaries for the anonymous public downloader and its outbound redirects."""
 import ipaddress
+import io
 from pathlib import Path
 import socket
 from urllib.parse import parse_qs, urlsplit
@@ -7,6 +8,7 @@ from urllib.request import BaseHandler
 
 import yt_dlp
 from yt_dlp.networking._urllib import UrllibRH
+from yt_dlp.utils import expand_path, is_path_like
 from instagram_media import InstagramMediaIE
 
 SOURCE_HOSTS = ('youtube.com', 'youtu.be', 'tiktok.com', 'instagram.com', 'facebook.com', 'fb.watch', 'twitter.com', 'x.com')
@@ -101,11 +103,26 @@ class PublicUrllibRH(UrllibRH):
         return opener
 
 
+class _RuntimeCookieFile(io.StringIO):
+    def truncate(self, size=None):
+        # yt-dlp truncates file-like cookie stores before saving, but unlike a
+        # newly opened disk file their cursor still follows the previous read.
+        if size == 0:
+            self.seek(0)
+        return super().truncate(size)
+
+
 class SafeYoutubeDL(yt_dlp.YoutubeDL):
     def __init__(self, params=None, *args, single_video=False, **kwargs):
         self._single_video = single_video
         options = {**(params or {}), 'allowed_extractors': ['(?!Generic).*'], 'enable_file_urls': False}
         options.pop('impersonate', None)
+        cookiefile = options.get('cookiefile')
+        if is_path_like(cookiefile):
+            # Deployment secrets can be read-only. Keep yt-dlp's updated
+            # cookies in a private memory store instead of rewriting the source.
+            with open(expand_path(cookiefile), encoding='utf-8') as source:
+                options['cookiefile'] = _RuntimeCookieFile(source.read())
         super().__init__(options, *args, **kwargs)
         self.add_info_extractor(InstagramMediaIE())
 
